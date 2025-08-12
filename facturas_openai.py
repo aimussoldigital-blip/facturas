@@ -12,9 +12,62 @@ from PIL import Image, ImageOps, ImageEnhance, ImageFilter
 from fpdf import FPDF
 from openai import OpenAI
 
+# --- Configuración de OpenAI con manejo de errores ---
+def configurar_openai():
+    """Configura OpenAI verificando múltiples posibles nombres de keys"""
+    
+    # Mostrar debug de secrets disponibles
+    st.sidebar.write("🔍 Debug - Secrets:")
+    try:
+        available_keys = list(st.secrets.keys())
+        st.sidebar.write(f"Keys encontradas: {available_keys}")
+    except:
+        st.sidebar.write("No se pudieron leer los secrets")
+    
+    # Lista de posibles nombres para la API key
+    possible_keys = [
+        "openai_api_key",
+        "OPENAI_API_KEY",
+        "openai-api-key", 
+        "openai_key",
+        "OPENAI_KEY",
+        "api_key"
+    ]
+    
+    # Intentar encontrar la key
+    for key_name in possible_keys:
+        try:
+            api_key = st.secrets[key_name]
+            client = OpenAI(api_key=api_key)
+            st.sidebar.success(f"✅ OpenAI configurado con key: '{key_name}'")
+            return client
+        except KeyError:
+            continue
+        except Exception as e:
+            st.sidebar.error(f"Error con key '{key_name}': {e}")
+            continue
+    
+    # Si no se encuentra ninguna key
+    st.error("❌ No se encontró la API key de OpenAI")
+    st.info("""
+    **Para configurar OpenAI en Streamlit Cloud:**
+    
+    1. Ve a tu app → **'Manage app'** (esquina inferior derecha)
+    2. Click en **'Settings'** → **'Secrets'**  
+    3. Añade exactamente esta línea:
+    ```
+    openai_api_key = "sk-tu-clave-completa-aquí"
+    ```
+    4. Guarda y reinicia la app
+    
+    **Para obtener tu API key:**
+    - Ve a: https://platform.openai.com/api-keys
+    - Crea una nueva key (empieza con 'sk-')
+    """)
+    st.stop()
 
-# --- Clave API desde secrets.toml ---
-client = OpenAI(api_key=st.secrets["openai_api_key"])
+# --- Inicializar cliente OpenAI ---
+client = configurar_openai()
 
 # --- Preprocesamiento mejorado para OCR ---
 def preprocess(img: Image.Image) -> Image.Image:
@@ -215,8 +268,6 @@ def extract_with_regex(texto: str) -> dict:
 
     return resultado
 
-
-
 # --- Extracción IA con OpenAI CORREGIDA ---
 def extract_data_with_openai(invoice_text: str) -> dict:
     texto_limpio = limpiar_texto(invoice_text)
@@ -259,7 +310,8 @@ def extract_data_with_openai(invoice_text: str) -> dict:
     """
 
     try:
-        response = openai.chat.completions.create(
+        # ✅ CORREGIDO: Usar 'client' en lugar de 'openai'
+        response = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[
                 {"role": "system", "content": "Extrae datos de facturas. Devuelve el JSON exactamente como se solicita."},
@@ -369,6 +421,18 @@ def process_file(file) -> dict:
 st.set_page_config(page_title="OCR + OpenAI Facturas", layout="wide")
 st.title("📄 Lector de Facturas - OCR + OpenAI (Versión Corregida)")
 st.markdown("Sube tus archivos PDF o imagen y extrae el Nº de Factura y Proveedor con mayor precisión.")
+
+# Test de conexión OpenAI en sidebar
+if st.sidebar.button("🧪 Test OpenAI"):
+    try:
+        test_response = client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": "Responde solo: OK"}],
+            max_tokens=10
+        )
+        st.sidebar.success("✅ Conexión OpenAI exitosa")
+    except Exception as e:
+        st.sidebar.error(f"❌ Error de conexión: {e}")
 
 # Información de ayuda
 with st.expander("ℹ️ Consejos para mejores resultados"):
@@ -498,7 +562,6 @@ if files:
 
     pdf_output = pdf.output(dest="S").encode("latin1")
     st.download_button("📥 Descargar PDF", data=pdf_output, file_name="resumen_facturas.pdf", mime="application/pdf")
-
 
 
 
