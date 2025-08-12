@@ -235,6 +235,50 @@ def limpiar_texto(texto: str) -> str:
             lineas_limpias.append(linea_limpia)
     return "\n".join(lineas_limpias)
 
+def preprocess_cv2(pil_img):
+    img = np.array(pil_img.convert("RGB"))[:, :, ::-1]           # PIL->BGR
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Deskew (rápido)
+    coords = np.column_stack(np.where(gray < 255))
+    angle = 0
+    if coords.size:
+        angle = cv2.minAreaRect(coords)[-1]
+        angle = -(90 + angle) if angle < -45 else -angle
+    (h, w) = gray.shape[:2]
+    M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+    gray = cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    # Binarización + limpieza
+    bw = cv2.adaptiveThreshold(gray,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                               cv2.THRESH_BINARY,35,15)
+    bw = cv2.medianBlur(bw, 3)
+    return bw
+
+def ocr_image_conf(pil_img) -> str:
+    if not TES_AVAILABLE:
+        raise TesseractNotFoundError("Tesseract no está instalado en el servidor.")
+    bw = preprocess_cv2(pil_img)
+    best_text, best_score = "", -1
+    # probamos varios PSM y nos quedamos con el mejor
+    for psm in [6, 4, 11, 12, 13]:
+        cfg = f"--oem 1 --psm {psm}"
+        data = pytesseract.image_to_data(bw, lang="spa+eng", config=cfg, output_type=pytesseract.Output.DICT)
+        # reconstruir por líneas con conf >= 70
+        lines = {}
+        for i, conf in enumerate(data["conf"]):
+            try:
+                c = int(conf)
+            except:
+                c = -1
+            if c < 70:
+                continue
+            ln = (data["page_num"][i], data["block_num"][i], data["par_num"][i], data["line_num"][i])
+            lines.setdefault(ln, []).append(data["text"][i])
+        text = "\n".join(" ".join(t for t in toks if t.strip()) for toks in lines.values())
+        score = len(re.findall(r'(?:factura|invoice|n[º°o]|num|serie)', text, re.I)) * 5 + len(text)
+        if score > best_score:
+            best_text, best_score = text, score
+    return best_text or ""
+    
 # =========================
 # Helper: score para Nº de factura
 # =========================
