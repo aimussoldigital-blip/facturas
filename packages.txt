@@ -1,5 +1,5 @@
-
-stesseract-ocr
-tesseract-ocr-spa
+tesseract-ocr
 tesseract-ocr-eng
+tesseract-ocr-spa
+
 
