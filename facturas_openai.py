@@ -1,7 +1,8 @@
-# --- Lector de Facturas con OCR + OpenAI (versión corregida) ---
+# --- Lector de Facturas con OCR + OpenAI (versión reparada) ---
 import streamlit as st
 import pandas as pd
 import pytesseract
+from pytesseract import TesseractNotFoundError
 import fitz  # PyMuPDF
 import io
 import tempfile
@@ -12,6 +13,18 @@ from PIL import Image, ImageOps, ImageEnhance, ImageFilter
 from fpdf import FPDF
 from openai import OpenAI
 
+# =========================
+# Utilidades de entorno
+# =========================
+def has_tesseract() -> bool:
+    try:
+        _ = pytesseract.get_tesseract_version()
+        return True
+    except Exception:
+        return False
+
+TES_AVAILABLE = has_tesseract()
+
 # --- Configuración de OpenAI con manejo de errores ---
 def configurar_openai():
     """Configura OpenAI verificando múltiples posibles nombres de keys"""
@@ -19,16 +32,12 @@ def configurar_openai():
     try:
         available_keys = list(st.secrets.keys())
         st.sidebar.write(f"Keys encontradas: {available_keys}")
-    except:
+    except Exception:
         st.sidebar.write("No se pudieron leer los secrets")
     
     possible_keys = [
-        "openai_api_key",
-        "OPENAI_API_KEY",
-        "openai-api-key", 
-        "openai_key",
-        "OPENAI_KEY",
-        "api_key"
+        "openai_api_key", "OPENAI_API_KEY", "openai-api-key",
+        "openai_key", "OPENAI_KEY", "api_key"
     ]
     for key_name in possible_keys:
         try:
@@ -43,19 +52,24 @@ def configurar_openai():
             continue
     
     st.error("❌ No se encontró la API key de OpenAI")
-    st.info("""
-    **Para configurar OpenAI en Streamlit Cloud:**
-    1) Manage app → Settings → Secrets
-    2) Añade exactamente:
-       openai_api_key = "sk-tu-clave"
-    3) Guarda y reinicia
-    """)
+    st.info(
+        "Manage app → Settings → Secrets → agrega:\n\n"
+        "openai_api_key = \"sk-tu-clave\""
+    )
     st.stop()
 
 # --- Inicializar cliente OpenAI ---
 client = configurar_openai()
 
-# --- Preprocesamiento OCR ---
+# Mostrar estado de Tesseract
+if TES_AVAILABLE:
+    st.sidebar.success("🧠 Tesseract: disponible")
+else:
+    st.sidebar.warning("⚠️ Tesseract: NO disponible (OCR de imágenes deshabilitado)")
+
+# =========================
+# OCR y extracción de texto
+# =========================
 def preprocess(img: Image.Image) -> Image.Image:
     if min(img.size) < 800:
         scale = 800 / min(img.size)
@@ -67,25 +81,41 @@ def preprocess(img: Image.Image) -> Image.Image:
     return img.point(lambda x: 0 if x < 140 else 255, "1")
 
 def ocr_image(img: Image.Image) -> str:
+    if not TES_AVAILABLE:
+        raise TesseractNotFoundError("Tesseract no está instalado en el servidor.")
     img_proc = preprocess(img)
     config = "--psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzÁÉÍÓÚáéíóúÑñ.,:-/() "
     return pytesseract.image_to_string(img_proc, lang="spa+eng", config=config)
 
 def text_from_pdf(path: pathlib.Path) -> str:
+    """Extrae texto de PDF priorizando texto embebido; usa OCR sólo si hay poco texto y Tesseract está disponible."""
     doc = fitz.open(path)
-    texto = []
+    partes = []
     for page in doc:
         emb = page.get_text("text").strip()
         if len(emb) > 50:
-            texto.append(emb)
+            partes.append(emb)
         else:
-            pix = page.get_pixmap(dpi=400)
-            with Image.open(io.BytesIO(pix.tobytes())) as im:
-                texto.append(ocr_image(im))
+            if TES_AVAILABLE:
+                # Rasterizar y OCR con mayor DPI únicamente si hay Tesseract
+                pix = page.get_pixmap(dpi=400)
+                with Image.open(io.BytesIO(pix.tobytes())) as im:
+                    partes.append(ocr_image(im))
+            else:
+                # Sin Tesseract, nos quedamos con lo que haya (aunque sea poco)
+                partes.append(emb)
     doc.close()
-    return "\n".join(texto)
+    return "\n".join(partes)
 
-# --- Limpieza de texto ---
+# =========================
+# Limpieza y reglas
+# =========================
+STOPWORDS_SUPPLIER = {
+    "FACTURA", "FACT", "INVOICE", "ALBARAN", "ALBARÁN", "TICKET",
+    "CLIENTE", "DESTINATARIO", "FACTURAR A", "BILL TO", "CUSTOMER",
+    "FECHA", "DATE", "IVA", "CIF", "NIF", "NIE"
+}
+
 def limpiar_texto(texto: str) -> str:
     lineas = texto.split("\n")
     lineas_limpias = []
@@ -100,7 +130,9 @@ def limpiar_texto(texto: str) -> str:
             lineas_limpias.append(linea_limpia)
     return "\n".join(lineas_limpias)
 
-# --- Extracción con regex ---
+# =========================
+# Reglas regex
+# =========================
 def extract_with_regex(texto: str) -> dict:
     resultado = {"nro_factura": "No encontrado", "proveedor": "No encontrado"}
     st.write("🔍 Debug - Primeras líneas del texto OCR:", texto[:500])
@@ -131,6 +163,8 @@ def extract_with_regex(texto: str) -> dict:
                     resultado["nro_factura"] = match
                     st.write(f"✅ Factura encontrada con patrón {i+1}: {match}")
                     break
+            if resultado["nro_factura"] != "No encontrado":
+                break
 
     lineas = texto.split('\n')
 
@@ -149,42 +183,44 @@ def extract_with_regex(texto: str) -> dict:
         r'CLIENTE:', r'CUSTOMER:', r'DESTINATARIO:', r'FACTURAR\s+A:', r'BILL\s+TO:',
     ]
 
-    for linea in lineas[:15]:
+    # 1) Buscar proveedores conocidos en más líneas (hasta 50)
+    for linea in lineas[:50]:
         linea_limpia = linea.strip()
         if len(linea_limpia) < 3:
             continue
 
-        es_cliente = False
-        for termino in terminos_cliente:
-            if re.search(termino, linea_limpia, re.IGNORECASE):
-                es_cliente = True
-                st.write(f"❌ Descartado como cliente: {linea_limpia}")
-                break
+        es_cliente = any(re.search(t, linea_limpia, re.IGNORECASE) for t in terminos_cliente)
         if es_cliente:
+            st.write(f"❌ Descartado como cliente: {linea_limpia}")
             continue
 
         for proveedor_patron in proveedores_conocidos:
             if re.search(proveedor_patron, linea_limpia, re.IGNORECASE):
-                resultado["proveedor"] = linea_limpia.strip()
-                st.write(f"✅ Proveedor conocido encontrado: {linea_limpia}")
-                return resultado
+                candidato = linea_limpia.strip()
+                if candidato.upper() not in STOPWORDS_SUPPLIER:
+                    resultado["proveedor"] = candidato
+                    st.write(f"✅ Proveedor conocido encontrado: {candidato}")
+                    return resultado
 
+    # 2) Detectar proveedor por dominio web
     for linea in lineas:
         match = re.search(r'www\.([a-z0-9\-]+)\.\w{2,}', linea.lower())
         if match:
             proveedor_web = match.group(1).replace('-', ' ').upper()
-            resultado["proveedor"] = proveedor_web
-            st.write(f"✅ Proveedor detectado por dominio web: {proveedor_web}")
-            return resultado
+            if proveedor_web and proveedor_web not in STOPWORDS_SUPPLIER:
+                resultado["proveedor"] = proveedor_web
+                st.write(f"✅ Proveedor detectado por dominio web: {proveedor_web}")
+                return resultado
 
+    # 3) Patrones generales de empresa (excluye stopwords)
     patrones_empresa = [
-        r'([A-ZÁÉÍÓÚÑ][A-Za-záéíóúñ\s]+(?:S\.?[AL]\.?|SOCIEDAD|LIMITADA|ANONIMA))',
+        r'([A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚáéíóúñ\s.&\-]+(?:S\.?[AL]\.?|SOCIEDAD|LIMITADA|AN(Ó|O)NIMA))',
         r'([A-ZÁÉÍÓÚÑ]{3,}(?:\s+[A-ZÁÉÍÓÚÑ]{3,})*(?:\s+S\.?[AL]\.?){0,1})',
         r'([A-ZÁÉÍÓÚÑ]+\s+\d{4}\s+S\.?L\.?)',
-        r'([A-ZÁÉÍÓÚÑ][A-Za-záéíóúñ]{2,}(?:\s+[A-ZÁÉÍÓÚÑ][A-Za-záéíóúñ]{2,}){1,3})',
+        r'([A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚáéíóúñ]{2,}(?:\s+[A-ZÁÉÍÓÚÑ][A-Za-zÁÉÍÓÚáéíóúñ]{2,}){1,3})',
     ]
 
-    for linea in lineas[:10]:
+    for linea in lineas[:20]:
         linea_limpia = linea.strip()
         if len(linea_limpia) < 5:
             continue
@@ -194,31 +230,37 @@ def extract_with_regex(texto: str) -> dict:
             match = re.search(patron, linea_limpia)
             if match:
                 candidato = match.group(1).strip()
-                if len(candidato) > 4 and not candidato.isdigit():
-                    es_cliente = any(re.search(term, candidato, re.IGNORECASE) for term in terminos_cliente)
-                    if not es_cliente:
-                        resultado["proveedor"] = candidato
-                        st.write(f"✅ Proveedor encontrado (patrón general): {candidato}")
-                        return resultado
+                cand_up = candidato.upper()
+                if (
+                    len(candidato) > 4 and not candidato.isdigit()
+                    and cand_up not in STOPWORDS_SUPPLIER
+                    and not any(re.search(t, candidato, re.IGNORECASE) for t in terminos_cliente)
+                ):
+                    resultado["proveedor"] = candidato
+                    st.write(f"✅ Proveedor encontrado (patrón general): {candidato}")
+                    return resultado
+
     return resultado
 
-# --- Extracción IA con OpenAI ---
+# =========================
+# OpenAI (refuerzo y normalización)
+# =========================
 def extract_data_with_openai(invoice_text: str) -> dict:
     texto_limpio = limpiar_texto(invoice_text)
     regex_result = extract_with_regex(texto_limpio)
     
     prompt = f"""
-    Eres un experto en análisis de facturas españolas. Analiza el texto y extrae:
-    1. NÚMERO DE FACTURA
-    2. PROVEEDOR (emisor)
-    Reglas: el proveedor es quien EMITE. Cliente NO es proveedor (ej: MISU, EL RINCON DE LA TORTILLA).
-    Devuelve SOLO JSON:
-    {{
-        "invoiceNumber": "número o No encontrado",
-        "supplier": "proveedor o No encontrado"
-    }}
-    TEXTO:
-    {texto_limpio[:3000]}
+Eres un experto en análisis de facturas españolas. Extrae:
+1) invoiceNumber (código de la factura)
+2) supplier (empresa EMISORA de la factura; NUNCA el cliente)
+NO aceptes valores genéricos (FACTURA/INVOICE/ALBARÁN/TICKET/CLIENTE).
+Devuelve SOLO JSON:
+{{
+  "invoiceNumber": "valor o No encontrado",
+  "supplier": "valor o No encontrado"
+}}
+TEXTO:
+{texto_limpio[:3000]}
     """
 
     try:
@@ -235,27 +277,33 @@ def extract_data_with_openai(invoice_text: str) -> dict:
         if content.startswith("```json"):
             content = content.replace("```json", "").replace("```", "").strip()
         parsed = json.loads(content)
+
         resultado = {
-            "nro_factura": parsed.get("invoiceNumber", "No encontrado"),
-            "proveedor": parsed.get("supplier", "No encontrado")
+            "nro_factura": parsed.get("invoiceNumber", "No encontrado") or "No encontrado",
+            "proveedor": parsed.get("supplier", "No encontrado") or "No encontrado"
         }
 
-        if resultado["nro_factura"] and resultado["nro_factura"] != "No encontrado":
+        # Normalizaciones y filtros
+        if resultado["nro_factura"] != "No encontrado":
             resultado["nro_factura"] = resultado["nro_factura"].strip()
-        if resultado["proveedor"] and resultado["proveedor"] != "No encontrado":
-            resultado["proveedor"] = resultado["proveedor"].strip()
-            terminos_cliente_filtro = ["MISU", "RINCON", "TORTILLA", "RESTAURANTE", "BAR", "CAFETERIA", 
-                                       "TABERNA", "ASADOR", "PIZZERIA", "HOTEL", "HOSTAL"]
-            es_cliente = any(termino in resultado["proveedor"].upper() for termino in terminos_cliente_filtro)
-            if es_cliente:
-                st.write(f"❌ Descartado como cliente: {resultado['proveedor']}")
-                resultado["proveedor"] = "No encontrado"
-            else:
-                if "MERCADONA" in resultado["proveedor"].upper():
-                    resultado["proveedor"] = "MERCADONA S.A."
-                elif "SUPRACAFE" in resultado["proveedor"].upper():
-                    resultado["proveedor"] = "SUPRACAFE"
 
+        if resultado["proveedor"] != "No encontrado":
+            prov = resultado["proveedor"].strip()
+            if prov.upper() in STOPWORDS_SUPPLIER:
+                prov = "No encontrado"
+            # Filtro de clientes comunes
+            terminos_cliente_filtro = ["MISU", "RINCON", "TORTILLA", "RESTAURANTE", "BAR",
+                                       "CAFETERIA", "TABERNA", "ASADOR", "PIZZERIA", "HOTEL", "HOSTAL"]
+            if any(t in prov.upper() for t in terminos_cliente_filtro):
+                prov = "No encontrado"
+            # Normalización de conocidos
+            if "MERCADONA" in prov.upper():
+                prov = "MERCADONA S.A."
+            elif "SUPRACAFE" in prov.upper() or "SUPRACAFÉ" in prov.upper():
+                prov = "SUPRACAFE"
+            resultado["proveedor"] = prov
+
+        # Backoff a regex si el LLM falla
         if resultado["nro_factura"] == "No encontrado" and regex_result["nro_factura"] != "No encontrado":
             resultado["nro_factura"] = regex_result["nro_factura"]
             st.write(f"🔄 Usando regex para factura: {resultado['nro_factura']}")
@@ -274,7 +322,9 @@ def extract_data_with_openai(invoice_text: str) -> dict:
         st.error(f"Error con OpenAI: {e}")
         return regex_result
 
-# --- Procesamiento de archivo ---
+# =========================
+# Proceso de archivos
+# =========================
 def process_file(file) -> dict:
     with tempfile.NamedTemporaryFile(delete=False, suffix=file.name) as tmp:
         tmp.write(file.read())
@@ -284,6 +334,8 @@ def process_file(file) -> dict:
         if tmp_path.suffix.lower() == ".pdf":
             texto = text_from_pdf(tmp_path)
         else:
+            if not TES_AVAILABLE:
+                return {"archivo": file.name, "nro_factura": "Error: Tesseract no está instalado", "proveedor": "Error: Tesseract no está instalado"}
             imagen = Image.open(tmp_path)
             if hasattr(imagen, '_getexif'):
                 exif = imagen._getexif()
@@ -299,26 +351,31 @@ def process_file(file) -> dict:
     except Exception as e:
         return {"archivo": file.name, "nro_factura": f"Error: {e}", "proveedor": f"Error: {e}"}
     finally:
-        tmp_path.unlink()
+        try:
+            tmp_path.unlink()
+        except Exception:
+            pass
 
-    if not texto.strip():
+    if not texto or not texto.strip():
         return {"archivo": file.name, "nro_factura": "Error: No se pudo extraer texto", "proveedor": "Error: No se pudo extraer texto"}
 
     with st.expander(f"🔍 Debug - Texto extraído de {file.name}"):
-        st.text_area("Texto OCR:", texto[:1000], height=200)
+        st.text_area("Texto OCR:", texto[:1500], height=220)
 
     result = extract_data_with_openai(texto)
     return {"archivo": file.name, **result}
 
-# --- UI Streamlit ---
+# =========================
+# UI Streamlit
+# =========================
 st.set_page_config(page_title="OCR + OpenAI Facturas", layout="wide")
-st.title("📄 Lector de Facturas - OCR + OpenAI (Versión Corregida)")
-st.markdown("Sube tus archivos PDF o imagen y extrae el Nº de Factura y Proveedor con mayor precisión.")
+st.title("📄 Lector de Facturas - OCR + OpenAI (Versión Reparada)")
+st.markdown("Sube tus archivos PDF o imagen y extrae el Nº de Factura y Proveedor con precisión.")
 
 # Test de conexión OpenAI
 if st.sidebar.button("🧪 Test OpenAI"):
     try:
-        test_response = client.chat.completions.create(
+        _ = client.chat.completions.create(
             model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": "Responde solo: OK"}],
             max_tokens=10
@@ -329,12 +386,10 @@ if st.sidebar.button("🧪 Test OpenAI"):
 
 with st.expander("ℹ️ Consejos para mejores resultados"):
     st.markdown("""
-    - **Calidad**: imágenes nítidas y con buen contraste
-    - **Orientación**: correcta rotación
-    - **Formato**: PDF nativo > imagen escaneada
-    - **Idioma**: mejor en español/inglés
-    - **Importante**: se identifica el **PROVEEDOR (emisor)**, no el cliente
-    """)
+- **PDF nativo** funciona mejor. Si subes **imágenes**, se requiere Tesseract.
+- El sistema identifica el **PROVEEDOR (emisor)**, no el cliente.
+- Si el nombre del proveedor es muy largo, se truncará en el PDF de salida.
+""")
 
 if st.button("🗑️ Limpiar archivos cargados"):
     st.session_state.clear()
@@ -368,15 +423,16 @@ if files:
         st.metric("Total archivos", len(files))
     
     df_display = df.copy()
+
     def highlight_results(row):
         colors = []
         for col in row.index:
             if col == "archivo":
                 colors.append("")
-            elif "No encontrado" in str(row[col]):
-                colors.append("background-color: #ffeb3b")
             elif "Error" in str(row[col]):
                 colors.append("background-color: #f44336; color: white")
+            elif "No encontrado" in str(row[col]):
+                colors.append("background-color: #ffeb3b")
             else:
                 colors.append("background-color: #4caf50; color: white")
         return colors
@@ -407,7 +463,7 @@ if files:
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
-    pdf.set_font("helvetica", "B", 16)  # usar helvetica
+    pdf.set_font("helvetica", "B", 16)
     pdf.cell(0, 10, "Resumen de Facturas Procesadas", ln=True, align="C")
     pdf.ln(10)
     
