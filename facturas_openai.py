@@ -7,13 +7,14 @@ import io
 import tempfile
 import pathlib
 import re
+import json
 from PIL import Image, ImageOps, ImageEnhance, ImageFilter
 from fpdf import FPDF
-import openai
-import json
+from openai import OpenAI
+
 
 # --- Clave API desde secrets.toml ---
-openai.api_key = st.secrets["openai_api_key"]
+client = OpenAI(api_key=st.secrets["openai_api_key"])
 
 # --- Preprocesamiento mejorado para OCR ---
 def preprocess(img: Image.Image) -> Image.Image:
