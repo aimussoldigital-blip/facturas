@@ -7,4 +7,4 @@ fpdf2>=2.7.9,<3
 openpyxl>=3.1,<4
 openai>=1.30.0,<2
 opencv-python-headless>=4.9,<5
-
+rapidfuzz>=3,<4
