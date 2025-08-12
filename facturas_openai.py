@@ -3,7 +3,6 @@
 # filtros NIF/CIF/teléfono/fecha, filtro de localidades y frases geo, fuzzy de proveedor,
 # normalizaciones (MAREGALEVILLA/SUPRACAFE/EHOSA), EHOSA contextual,
 # keys únicos y PDF/Excel de salida.
-
 import streamlit as st
 import pandas as pd
 import pytesseract
@@ -18,12 +17,10 @@ import unicodedata
 from PIL import Image
 from fpdf import FPDF
 from openai import OpenAI
-
 # Nuevas dependencias
 import cv2
 import numpy as np
 from rapidfuzz import process, fuzz
-
 # ✅ Siempre primero en Streamlit:
 st.set_page_config(page_title="OCR + OpenAI Facturas", layout="wide")
 
@@ -36,7 +33,6 @@ def has_tesseract() -> bool:
         return True
     except Exception:
         return False
-
 TES_AVAILABLE = has_tesseract()
 
 # --- Configuración de OpenAI ---
@@ -47,7 +43,6 @@ def configurar_openai():
         st.sidebar.write(f"Keys encontradas: {available_keys}")
     except Exception:
         st.sidebar.write("No se pudieron leer los secrets")
-
     for key_name in ["openai_api_key","OPENAI_API_KEY","openai-api-key","openai_key","OPENAI_KEY","api_key"]:
         try:
             api_key = st.secrets[key_name]
@@ -59,7 +54,6 @@ def configurar_openai():
         except Exception as e:
             st.sidebar.error(f"Error con key '{key_name}': {e}")
             continue
-
     st.error("❌ No se encontró la API key de OpenAI")
     st.info("Manage app → Settings → Secrets → agrega:\n\nopenai_api_key = \"sk-...\"")
     st.stop()
@@ -85,8 +79,9 @@ CLIENT_HINTS = [
     r'CLIENTE:', r'CUSTOMER:', r'DESTINATARIO:', r'FACTURAR\s+A:', r'BILL\s+TO:'
 ]
 
+# MODIFICACIÓN: Eliminamos ATOCHA y VALLECAS de ubicaciones geográficas
 COMMON_GEO_WORDS = {
-    "MADRID","GETAFE","VALLECAS","ATOCHA","ALCORCON","ALCORCÓN","MOSTOLES","MÓSTOLES",
+    "MADRID","GETAFE","ALCORCON","ALCORCÓN","MOSTOLES","MÓSTOLES",
     "BARCELONA","SEVILLA","VALENCIA","MALAGA","MÁLAGA","ZARAGOZA","BILBAO","TOLEDO",
     "ALICANTE","CORDOBA","CÓRDOBA","VALLADOLID","GIJON","GIJÓN","LEGANES","LEGANÉS",
     "PARLA","FUENLABRADA","RIVAS","MAJADAHONDA","ALCOBENDAS","SANSE","SAN SEBASTIAN",
@@ -100,15 +95,21 @@ KNOWN_SUPPLIERS = [
     r'EHOSA', r'ELESPEJO\s+HOSTELEROS?\s*S\.?A\.?',
     r'CONGELADOS?\s*EL\s*GORDO', r'CONGELADOS?ELGORDO',
     r'MERCADONA\s*S\.?A\.?', r'MAKRO', r'CARREFOUR', r'ALCAMPO', r'DIA\s*S\.?A\.?',
-    r'LIDL', r'ALDI', r'EROSKI', r'HIPERCOR', r'CORTE\s*INGLES', r'METRO\s*CASH',
+    r'LIDL', r'ALDI', r'EROSKI', r'HIPERCOR', r'CORTE\s+INGLES', r'METRO\s*CASH',
     r'ALIMENTACION\s+[A-ZÁÉÍÓÚÑ]+', r'DISTRIBUCIONES\s+[A-ZÁÉÍÓÚÑ]+',
     r'MAYORISTAS?\s+[A-ZÁÉÍÓÚÑ]+', r'SUMINISTROS?\s+[A-ZÁÉÍÓÚÑ]+',
+    r'HORMART',
+    r'ATOCHA\s*VALLECAS', r'ATOCHA-VALLECAS', r'ATOCHAVALLECAS',  # <-- AÑADIDO
 ]
+
 # Lista canónica para fuzzy
 KNOWN_SUPPLIERS_CANON = [
     "SUPRACAFE", "MAREGALEVILLA", "EHOSA", "MERCADONA S.A.",
-    "COCA-COLA EUROPACIFIC PARTNERS", "HOTMART BV", "OUIGO ESPAÑA S.A.U."
+    "COCA-COLA EUROPACIFIC PARTNERS", "HOTMART BV", "OUIGO ESPAÑA S.A.U.",
+    "HORMART",
+    "ATOCHA VALLECAS",  # <-- AÑADIDO
 ]
+
 SHORT_VALID_SUPPLIERS = {"DIA"}  # permitir siglas reales
 
 # =========================
@@ -123,12 +124,26 @@ def _norm(s: str) -> str:
 
 def is_geo_word(s: str) -> bool:
     u = _norm(s).strip()
-    return (u in COMMON_GEO_WORDS) or \
-           (re.fullmatch(r'[A-ZÁÉÍÓÚÑ]{3,12}', u) and u not in SHORT_VALID_SUPPLIERS and u not in STOPWORDS_SUPPLIER)
+    # Si la cadena completa es una palabra geográfica
+    if u in COMMON_GEO_WORDS:
+        return True
+    # Si alguna palabra de la cadena (separada por espacios) es geográfica
+    words = u.split()
+    for word in words:
+        if word in COMMON_GEO_WORDS:
+            return True
+    # Si es una palabra de 3 a 12 letras, mayúsculas, y no es proveedor válido ni stopword
+    return (re.fullmatch(r'[A-ZÁÉÍÓÚÑ]{3,12}', u) and u not in SHORT_VALID_SUPPLIERS and u not in STOPWORDS_SUPPLIER)
 
 def looks_like_geo_phrase(s: str) -> bool:
     u = _norm(s or "")
-    return (" ESPAÑA" in u) or (" SPAIN" in u) or (any(g in u for g in COMMON_GEO_WORDS) and len(u) <= 20)
+    if " ESPAÑA" in u or " SPAIN" in u:
+        return True
+    words = u.split()
+    for word in words:
+        if word in COMMON_GEO_WORDS:
+            return True
+    return False
 
 def is_probably_supplier_line(s: str) -> bool:
     s_up = _norm(s).strip()
@@ -158,39 +173,43 @@ def normalize_supplier_from_text(full_text: str, current_supplier: str) -> str:
     """Prioriza MAREGALEVILLA si aparece; mantiene SUPRACAFE/EHOSA; evita sobreescribir otros fuertes."""
     t = _norm(full_text)
     cur = _norm(current_supplier)
-
     # 1) MAREGALEVILLA
     mare_in_doc = (re.search(r'\bMAREGALEVILLA\b', t) is not None) or ("WWW.MAREGALEVILLA." in t)
     if mare_in_doc:
         if (not cur) or ("NO ENCONTRADO" in cur) or (len(cur) <= 3) or (cur in STOPWORDS_SUPPLIER) or ("CONGELADOS" in cur and "GORDO" in cur):
             return "MAREGALEVILLA"
-
     # 2) SUPRACAFE
     if re.search(r'\bSUPRACAFE\b', t) or re.search(r'\bSUPRA\s*CAFE\b', t) or "WWW.SUPRACAFE." in t:
         if (not cur) or ("NO ENCONTRADO" in cur) or (len(cur) <= 3) or (cur in STOPWORDS_SUPPLIER):
             return "SUPRACAFE"
         if not any(name in cur for name in ["MERCADONA","CARREFOUR","ALCAMPO","EROSKI","EHOSA","MAKRO","MAREGALEVILLA"]):
             return "SUPRACAFE"
-
     # 3) EHOSA
     if "EHOSA" in t and ((not cur) or ("NO ENCONTRADO" in cur) or (len(cur) <= 3) or (cur in STOPWORDS_SUPPLIER)):
         return "EHOSA"
-
+    # 4) HORMART
+    if "HORMART" in t and ((not cur) or ("NO ENCONTRADO" in cur) or (len(cur) <= 3) or (cur in STOPWORDS_SUPPLIER)):
+        return "HORMART"
+    # 5) ATOCHA VALLECAS - NUEVO
+    if re.search(r'\bATOCHA\s*VALLECAS\b', t) and ((not cur) or ("NO ENCONTRADO" in cur) or (len(cur) <= 3) or (cur in STOPWORDS_SUPPLIER)):
+        return "ATOCHA VALLECAS"
     return current_supplier
 
 def normalize_supplier_label(label: str, full_text: str) -> str:
     """Corrige compactados y aplica preferencia contextual (MAREGALEVILLA sobre 'Congelados El Gordo')."""
     u = _norm(label)
     t = _norm(full_text)
-
     if re.search(r'\bMAREGALEVILLA\b', t) or "WWW.MAREGALEVILLA." in t:
         return "MAREGALEVILLA"
-
     mapping = [
         (r'^CONGELADOSELGORDO$', 'CONGELADOS EL GORDO'),
         (r'^COCA COLA EUROPACIFIC PARTN(ERS|ER)?S?$', 'COCA-COLA EUROPACIFIC PARTNERS'),
         (r'^SUPRACAFE$', 'SUPRACAFE'),
         (r'^EHOSA$', 'EHOSA'),
+        (r'^HORMART$', 'HORMART'),
+        (r'^ATOCHA\s*VALLECAS$', 'ATOCHA VALLECAS'),  # <-- AÑADIDO
+        (r'^ATOCHA-VALLECAS$', 'ATOCHA VALLECAS'),     # <-- AÑADIDO
+        (r'^ATOCHAVALLECAS$', 'ATOCHA VALLECAS'),      # <-- AÑADIDO
     ]
     for pat, rep in mapping:
         if re.match(pat, u):
@@ -334,14 +353,15 @@ def extract_invoice_contextual(texto: str) -> str:
         re.IGNORECASE
     )
     pat_next = re.compile(r'(FACTURA|INVOICE|N[º°o]\s*FACTURA|NUM(?:ERO)?\s*FACTURA)\s*[:#-]?\s*$', re.IGNORECASE)
-
-    for i, l in enumerate(lines[:200]):
+    # Ampliamos a 500 líneas
+    for i, l in enumerate(lines[:500]):
         m = pat_inline.search(l)
         if m:
             val = m.group(1).strip()
             if not invalid_invoice_like(val) and score_invoice(val) >= 3:
                 return val
         if pat_next.search(l) and i + 1 < len(lines):
+            # En la siguiente línea, buscamos cualquier número de factura válido
             vals = re.findall(r'(\d{7,10}|[A-Z0-9][A-Z0-9\-/\.]{4,})', lines[i + 1])
             if vals:
                 cand = vals[0]
@@ -357,6 +377,11 @@ def fix_invoice_for_supplier(nro: str, texto: str, supplier: str) -> str:
             ctx = extract_invoice_contextual(texto)
             if ctx != "No encontrado":
                 return ctx
+            # Si no se encontró con contexto, buscamos cualquier número de 8 dígitos que no sea NIF/CIF/etc.
+            numbers = re.findall(r'\b(\d{8})\b', texto)
+            for num in numbers:
+                if not invalid_invoice_like(num):
+                    return num
     return nro
 
 # =========================
@@ -365,12 +390,13 @@ def fix_invoice_for_supplier(nro: str, texto: str, supplier: str) -> str:
 def extract_with_regex(texto: str) -> dict:
     resultado = {"nro_factura": "No encontrado", "proveedor": "No encontrado"}
     st.write("🔍 Debug - Primeras líneas OCR:", texto[:500])
-
+    
     # Patrones fuertes primero
     patrones_factura = [
         r'([A-Z]{1,3}-[A-Z0-9]{1,4}-\d{5,15})',   # A-V2025-00002609357
         r'(FV[-/]?\d{1,2}[-/]?\d{5,10})',          # FV-0-2515226
         r'([A-Z]\d{9,18})',                        # C2025000851658 / e20252529117
+        r'\b(\d{8})\b',                            # Para 01116253 (nuevo)
         # Patrones previos
         r'(?:factura|invoice|fact|fac|nº|n°|no|num|number)[\s:.-]*([A-Z0-9\-/\.]{3,25})',
         r'([A-Z]{1,2}[-/]?\d{4,12})',
@@ -383,6 +409,7 @@ def extract_with_regex(texto: str) -> dict:
         r'([A-Z]{2,5}[-/]?\d{3,12})',
         r'\b\d{7,8}\b'
     ]
+    
     for i, patron in enumerate(patrones_factura):
         matches = re.findall(patron, texto, re.IGNORECASE | re.MULTILINE)
         if matches:
@@ -396,9 +423,8 @@ def extract_with_regex(texto: str) -> dict:
                     break
             if resultado["nro_factura"] != "No encontrado":
                 break
-
+    
     lineas = texto.split('\n')
-
     def has_contact_noise(s: str) -> bool:
         return re.search(r'(TEL|TLF|TELEF|M[ÓO]VIL|FAX|EMAIL|E-?MAIL|@|WHATSAPP|WEB|WWW|HTTP)', s, re.IGNORECASE) is not None
 
@@ -493,7 +519,6 @@ def extract_with_regex(texto: str) -> dict:
         best = process.extractOne(_norm(cand3), KNOWN_SUPPLIERS_CANON, scorer=fuzz.token_sort_ratio)
         if not (best and best[1] >= 90) and not (looks_like_corporate_name(cand3) or re.fullmatch(r'[A-Z0-9&\-\s]{4,24}', _norm(cand3))):
             resultado["proveedor"] = "No encontrado"
-
     resultado["nro_factura"] = fix_invoice_for_supplier(resultado["nro_factura"], texto, resultado["proveedor"])
     return resultado
 
@@ -507,7 +532,8 @@ def invoice_from_filename(fname: str) -> str:
         r'([A-Z]{1,3}-[A-Z0-9]{1,4}-\d{5,15})',
         r'(FV[-/]?\d{1,2}[-/]?\d{5,10})',
         r'([A-Z]\d{9,18})',
-        r'([A-Z]{2,5}[-/]?\d{3,12})'
+        r'([A-Z]{2,5}[-/]?\d{3,12})',
+        r'\b(\d{8})\b'  # Para 01116253
     ]:
         m = re.search(pat, base, re.IGNORECASE)
         if m:
@@ -536,7 +562,6 @@ def supplier_from_filename(fname: str) -> str:
 def extract_data_with_openai(invoice_text: str) -> dict:
     texto_limpio = limpiar_texto(invoice_text)
     regex_result = extract_with_regex(texto_limpio)
-
     prompt = f"""
 Eres un experto en facturas españolas. Extrae:
 1) invoiceNumber: código de la factura
@@ -564,12 +589,10 @@ TEXTO:
         if content.startswith("```json"):
             content = content.replace("```json", "").replace("```", "").strip()
         parsed = json.loads(content)
-
         out = {
             "nro_factura": (parsed.get("invoiceNumber") or "No encontrado").strip(),
             "proveedor": (parsed.get("supplier") or "No encontrado").strip()
         }
-
         # Post-procesado proveedor
         prov = _norm(out["proveedor"])
         if prov in STOPWORDS_SUPPLIER or is_geo_word(prov) or looks_like_geo_phrase(prov):
@@ -582,7 +605,11 @@ TEXTO:
             out["proveedor"] = "SUPRACAFE"
         elif "EHOSA" in prov:
             out["proveedor"] = "EHOSA"
-
+        elif "HORMART" in prov:
+            out["proveedor"] = "HORMART"
+        elif "ATOCHA" in prov and "VALLECAS" in prov:  # <-- AÑADIDO
+            out["proveedor"] = "ATOCHA VALLECAS"
+        
         # Elegir mejor nº de factura entre LLM y regex
         r_alt = regex_result.get("nro_factura", "No encontrado")
         if out["nro_factura"] == "No encontrado" and r_alt != "No encontrado":
@@ -594,47 +621,48 @@ TEXTO:
                 out["nro_factura"] = r_alt
             if re.fullmatch(r'\d{1,5}', (best or "")) and r_alt and r_alt != "No encontrado":
                 out["nro_factura"] = r_alt
+        
         # Evitar NIF/CIF/teléfono/fecha como factura
         best_now = out["nro_factura"]
         alt = regex_result.get("nro_factura", "No encontrado")
         if invalid_invoice_like(best_now) and alt and alt != "No encontrado" and not invalid_invoice_like(alt):
             out["nro_factura"] = alt
-
+        
         # Backoff proveedor desde regex si LLM no lo encontró
         if out["proveedor"] == "No encontrado" and regex_result["proveedor"] != "No encontrado":
             out["proveedor"] = regex_result["proveedor"]
             st.write(f"🔄 Usando regex para proveedor: {out['proveedor']}")
-
+        
         # Normalizaciones fuertes + filtros
         out["proveedor"] = normalize_supplier_from_text(invoice_text, out["proveedor"])
         out["proveedor"] = normalize_supplier_label(out["proveedor"], invoice_text)
         if is_geo_word(out["proveedor"]) or looks_like_geo_phrase(out["proveedor"]):
             out["proveedor"] = "No encontrado"
+        
         # Fuzzy/aceptación corporativa o marca clara
         if out["proveedor"] not in ("No encontrado", "", None):
             cand = out["proveedor"]
             best = process.extractOne(_norm(cand), KNOWN_SUPPLIERS_CANON, scorer=fuzz.token_sort_ratio)
             if not (best and best[1] >= 90) and not (looks_like_corporate_name(cand) or re.fullmatch(r'[A-Z0-9&\-\s]{4,24}', _norm(cand))):
                 out["proveedor"] = "No encontrado"
-
+        
         # EHOSA: fijar nº por contexto si hace falta
         out["nro_factura"] = fix_invoice_for_supplier(out["nro_factura"], invoice_text, out["proveedor"])
-
+        
         # Fallback por nombre de archivo (proveedor)
         fname = st.session_state.get("current_filename", "")
         if out["proveedor"] == "No encontrado" and fname:
             altp = supplier_from_filename(fname)
             if altp != "No encontrado":
                 out["proveedor"] = altp
-
+        
         st.write(f"✅ Final - Factura: {out['nro_factura']} | Proveedor: {out['proveedor']}")
         return out
-
     except json.JSONDecodeError as e:
         st.warning(f"Error JSON OpenAI: {e}")
         st.write(f"Contenido recibido: {content}")
         regex_result["proveedor"] = normalize_supplier_from_text(invoice_text, regex_result["proveedor"])
-        regex_result["proveedor"] = normalize_supplier_label(regex_result["proveedor"], invoice_text)
+        regex_result["proveedor"] = normalize_supplier_label(regex_result["proveedor"], texto)
         if is_geo_word(regex_result["proveedor"]) or looks_like_geo_phrase(regex_result["proveedor"]):
             regex_result["proveedor"] = "No encontrado"
         if regex_result["proveedor"] not in ("No encontrado", "", None):
@@ -644,20 +672,17 @@ TEXTO:
                 regex_result["proveedor"] = "No encontrado"
         # EHOSA contextual
         regex_result["nro_factura"] = fix_invoice_for_supplier(regex_result["nro_factura"], invoice_text, regex_result["proveedor"])
-
         # Fallback proveedor por nombre de archivo
         fname = st.session_state.get("current_filename", "")
         if regex_result["proveedor"] == "No encontrado" and fname:
             altp = supplier_from_filename(fname)
             if altp != "No encontrado":
                 regex_result["proveedor"] = altp
-
         return regex_result
-
     except Exception as e:
         st.error(f"Error OpenAI: {e}")
         regex_result["proveedor"] = normalize_supplier_from_text(invoice_text, regex_result["proveedor"])
-        regex_result["proveedor"] = normalize_supplier_label(regex_result["proveedor"], invoice_text)
+        regex_result["proveedor"] = normalize_supplier_label(regex_result["proveedor"], texto)
         if is_geo_word(regex_result["proveedor"]) or looks_like_geo_phrase(regex_result["proveedor"]):
             regex_result["proveedor"] = "No encontrado"
         if regex_result["proveedor"] not in ("No encontrado", "", None):
@@ -667,14 +692,12 @@ TEXTO:
                 regex_result["proveedor"] = "No encontrado"
         # EHOSA contextual
         regex_result["nro_factura"] = fix_invoice_for_supplier(regex_result["nro_factura"], invoice_text, regex_result["proveedor"])
-
         # Fallback proveedor por nombre de archivo
         fname = st.session_state.get("current_filename", "")
         if regex_result["proveedor"] == "No encontrado" and fname:
             altp = supplier_from_filename(fname)
             if altp != "No encontrado":
                 regex_result["proveedor"] = altp
-
         return regex_result
 
 # =========================
@@ -686,7 +709,6 @@ def process_file(file, widget_key: str = "") -> dict:
         tmp.write(file.read())
         tmp_path = pathlib.Path(tmp.name)
         tmp_key = tmp_path.name  # fallback para key único
-
     try:
         if tmp_path.suffix.lower() == ".pdf":
             texto = text_from_pdf(tmp_path)
@@ -713,10 +735,8 @@ def process_file(file, widget_key: str = "") -> dict:
             tmp_path.unlink()
         except Exception:
             pass
-
     if not texto or not texto.strip():
         return {"archivo": file.name, "nro_factura": "Error: No se pudo extraer texto", "proveedor": "Error: No se pudo extraer texto"}
-
     with st.expander(f"🔍 Debug - Texto extraído de {file.name}"):
         st.text_area(
             "Texto OCR:",
@@ -724,9 +744,7 @@ def process_file(file, widget_key: str = "") -> dict:
             height=220,
             key=f"ta_ocr_{widget_key or tmp_key}"
         )
-
     result = extract_data_with_openai(texto)
-
     # Fallback Nº de factura desde el nombre de archivo (preferir si es mejor)
     alt_inv = invoice_from_filename(file.name)
     cur = result.get("nro_factura") or "No encontrado"
@@ -736,7 +754,6 @@ def process_file(file, widget_key: str = "") -> dict:
         if not ("EHOSA" in sup and EHOSA_BAD_PAT.match(alt_inv or "")):
             if invalid_invoice_like(cur) or score_invoice(alt_inv) >= max(1, score_invoice(cur)):
                 result["nro_factura"] = alt_inv
-
     return {"archivo": file.name, **result}
 
 # =========================
@@ -779,17 +796,15 @@ if files:
         resultado = process_file(file, widget_key=f"{i}_{file.name}")
         resultados.append(resultado)
         progress_bar.progress((i + 1) / len(files))
-
     status_text.text("¡Procesamiento completado!")
+    
     df = pd.DataFrame(resultados)
-
     st.subheader("📋 Resultados")
-
+    
     # Métricas SIN f-strings partidos (evita SyntaxError)
     prev_fact = st.session_state.get("prev_fact_ok", 0)
     prev_prov = st.session_state.get("prev_prov_ok", 0)
     prev_files = st.session_state.get("prev_files", 0)
-
     col1, col2, col3 = st.columns(3)
     with col1:
         facturas_ok = sum(1 for r in resultados if "No encontrado" not in r["nro_factura"] and "Error" not in r["nro_factura"])
@@ -803,11 +818,11 @@ if files:
         total_arch = len(files)
         delta_files = total_arch - prev_files
         st.metric("Total archivos", total_arch, delta=f"{delta_files:+d}")
-
+    
     st.session_state["prev_fact_ok"] = facturas_ok
     st.session_state["prev_prov_ok"] = proveedores_ok
     st.session_state["prev_files"] = total_arch
-
+    
     def highlight_results(row):
         colors = []
         for col in row.index:
@@ -821,7 +836,7 @@ if files:
             else:
                 colors.append("background-color: #4caf50; color: white")
         return colors
-
+    
     st.dataframe(
         df.style.apply(highlight_results, axis=1),
         use_container_width=True,
@@ -831,7 +846,7 @@ if files:
             "proveedor": st.column_config.TextColumn("Proveedor", width="large")
         }
     )
-
+    
     with st.expander("📊 Detalles"):
         for r in resultados:
             st.write(f"**{r['archivo']}**")
@@ -841,9 +856,8 @@ if files:
             with c2:
                 st.write(f"• Proveedor: `{r['proveedor']}`")
             st.divider()
-
+    
     st.subheader("📤 Descargar")
-
     # -------- PDF (fpdf2) --------
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
@@ -851,13 +865,11 @@ if files:
     pdf.set_font("helvetica", "B", 16)
     pdf.cell(0, 10, "Resumen de Facturas Procesadas", ln=True, align="C")
     pdf.ln(10)
-
     pdf.set_font("helvetica", "B", 10)
     pdf.set_fill_color(200, 200, 200)
     pdf.cell(70, 10, "Archivo", 1, 0, 'C', 1)
     pdf.cell(60, 10, "Numero Factura", 1, 0, 'C', 1)
     pdf.cell(60, 10, "Proveedor", 1, 1, 'C', 1)
-
     pdf.set_font("helvetica", size=9)
     for r in resultados:
         archivo = r["archivo"][:32] + "..." if len(r["archivo"]) > 35 else r["archivo"]
@@ -870,11 +882,10 @@ if files:
         pdf.cell(70, 8, archivo, 1, 0, 'L')
         pdf.cell(60, 8, nro_factura, 1, 0, 'L')
         pdf.cell(60, 8, proveedor, 1, 1, 'L')
-
     out = pdf.output(dest="S")
     pdf_bytes = bytes(out) if isinstance(out, (bytearray, bytes)) else out.encode("latin-1")
     st.download_button("📥 Descargar PDF", data=pdf_bytes, file_name="resumen_facturas.pdf", mime="application/pdf")
-
+    
     # Excel
     excel_buf = io.BytesIO()
     df.to_excel(excel_buf, index=False, engine="openpyxl")
@@ -885,7 +896,6 @@ if files:
         file_name="facturas_procesadas.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
-
 
 
 
