@@ -1,7 +1,7 @@
 # --- Lector de Facturas con OCR + OpenAI ---
-# Cloud: OCR robusto (OpenCV + Tesseract multi-PSM), filtros NIF/CIF/teléfono,
-# filtro de localidades, fuzzy de proveedor y normalizaciones (MAREGALEVILLA/SUPRACAFE/EHOSA),
-# keys únicos en widgets y PDF/Excel de salida.
+# Cloud: OCR robusto (OpenCV + Tesseract multi-PSM), patrones fuertes Nº factura,
+# filtros NIF/CIF/teléfono/fecha, filtro de localidades y frases geo, fuzzy de proveedor,
+# normalizaciones (MAREGALEVILLA/SUPRACAFE/EHOSA), keys únicos y PDF/Excel.
 
 import streamlit as st
 import pandas as pd
@@ -89,7 +89,7 @@ COMMON_GEO_WORDS = {
     "BARCELONA","SEVILLA","VALENCIA","MALAGA","MÁLAGA","ZARAGOZA","BILBAO","TOLEDO",
     "ALICANTE","CORDOBA","CÓRDOBA","VALLADOLID","GIJON","GIJÓN","LEGANES","LEGANÉS",
     "PARLA","FUENLABRADA","RIVAS","MAJADAHONDA","ALCOBENDAS","SANSE","SAN SEBASTIAN",
-    "TARRAGONA","CASTELLON","CASTELLÓN"
+    "TARRAGONA","CASTELLON","CASTELLÓN","ESPAÑA","SPAIN"
 }
 
 # Patrones conocidos de proveedores (detección inicial)
@@ -125,13 +125,17 @@ def is_geo_word(s: str) -> bool:
     return (u in COMMON_GEO_WORDS) or \
            (re.fullmatch(r'[A-ZÁÉÍÓÚÑ]{3,12}', u) and u not in SHORT_VALID_SUPPLIERS and u not in STOPWORDS_SUPPLIER)
 
+def looks_like_geo_phrase(s: str) -> bool:
+    u = _norm(s or "")
+    return (" ESPAÑA" in u) or (" SPAIN" in u) or (any(g in u for g in COMMON_GEO_WORDS) and len(u) <= 20)
+
 def is_probably_supplier_line(s: str) -> bool:
     s_up = _norm(s).strip()
     if not s_up:
         return False
     if any(x in s_up for x in STOPWORDS_SUPPLIER):
         return False
-    if is_geo_word(s_up):
+    if is_geo_word(s_up) or looks_like_geo_phrase(s_up):
         return False
     if len(s_up) <= 3 and s_up not in SHORT_VALID_SUPPLIERS:
         return False
@@ -190,7 +194,7 @@ def normalize_supplier_label(label: str, full_text: str) -> str:
 
 def pick_supplier_fuzzy(candidate: str) -> str:
     cand = _norm(candidate).strip()
-    if not cand or is_geo_word(cand):
+    if not cand or is_geo_word(cand) or looks_like_geo_phrase(cand):
         return "No encontrado"
     best = process.extractOne(cand, KNOWN_SUPPLIERS_CANON, scorer=fuzz.token_sort_ratio)
     if best and best[1] >= 90:
@@ -305,8 +309,13 @@ def looks_like_cif(s: str) -> bool:
 def looks_like_phone(s: str) -> bool:
     return re.search(r'(\+34)?\s?\d{3}[\s-]?\d{2,3}[\s-]?\d{2,3}', s or "") is not None
 
+def looks_like_date(s: str) -> bool:
+    s = (s or "").strip()
+    return bool(re.fullmatch(r'\d{2}[/-]\d{2}[/-]\d{4}', s) or
+                re.fullmatch(r'\d{4}[/-]\d{2}[/-]\d{2}', s))
+
 def invalid_invoice_like(s: str) -> bool:
-    return looks_like_nif(s) or looks_like_cif(s) or looks_like_phone(s)
+    return looks_like_nif(s) or looks_like_cif(s) or looks_like_phone(s) or looks_like_date(s)
 
 # =========================
 # Regex: factura / proveedor
@@ -315,14 +324,18 @@ def extract_with_regex(texto: str) -> dict:
     resultado = {"nro_factura": "No encontrado", "proveedor": "No encontrado"}
     st.write("🔍 Debug - Primeras líneas OCR:", texto[:500])
 
+    # Patrones fuertes primero
     patrones_factura = [
+        r'([A-Z]{1,3}-[A-Z0-9]{1,4}-\d{5,15})',   # A-V2025-00002609357
+        r'(FV[-/]?\d{1,2}[-/]?\d{5,10})',          # FV-0-2515226
+        r'([A-Z]\d{9,18})',                        # C2025000851658 / e20252529117
+        # Patrones previos
         r'(?:factura|invoice|fact|fac|nº|n°|no|num|number)[\s:.-]*([A-Z0-9\-/\.]{3,25})',
         r'([A-Z]{1,2}[-/]?\d{4,12})',
         r'(\d{6,15})',
         r'(\d{4,12}[-/][A-Z0-9]{1,8})',
         r'([A-Z]\d{8,15})',
         r'(e\d{8,15})',
-        r'(FV[-/]?\d+[-/]?\d+)',
         r'F[-/]?(\d{4,12})',
         r'INV[-/]?(\d{4,12})',
         r'([A-Z]{2,5}[-/]?\d{3,12})',
@@ -360,7 +373,7 @@ def extract_with_regex(texto: str) -> dict:
                 resultado["proveedor"] = l.strip()
                 resultado["proveedor"] = normalize_supplier_from_text(texto, resultado["proveedor"])
                 resultado["proveedor"] = normalize_supplier_label(resultado["proveedor"], texto)
-                if is_geo_word(resultado["proveedor"]):
+                if is_geo_word(resultado["proveedor"]) or looks_like_geo_phrase(resultado["proveedor"]):
                     resultado["proveedor"] = "No encontrado"
                 if resultado["proveedor"] not in ("No encontrado", "", None):
                     resultado["proveedor"] = pick_supplier_fuzzy(resultado["proveedor"])
@@ -378,7 +391,7 @@ def extract_with_regex(texto: str) -> dict:
                 resultado["proveedor"] = prov
                 resultado["proveedor"] = normalize_supplier_from_text(texto, resultado["proveedor"])
                 resultado["proveedor"] = normalize_supplier_label(resultado["proveedor"], texto)
-                if is_geo_word(resultado["proveedor"]):
+                if is_geo_word(resultado["proveedor"]) or looks_like_geo_phrase(resultado["proveedor"]):
                     resultado["proveedor"] = "No encontrado"
                 if resultado["proveedor"] not in ("No encontrado", "", None):
                     resultado["proveedor"] = pick_supplier_fuzzy(resultado["proveedor"])
@@ -408,7 +421,7 @@ def extract_with_regex(texto: str) -> dict:
                     resultado["proveedor"] = cand
                     resultado["proveedor"] = normalize_supplier_from_text(texto, resultado["proveedor"])
                     resultado["proveedor"] = normalize_supplier_label(resultado["proveedor"], texto)
-                    if is_geo_word(resultado["proveedor"]):
+                    if is_geo_word(resultado["proveedor"]) or looks_like_geo_phrase(resultado["proveedor"]):
                         resultado["proveedor"] = "No encontrado"
                     if resultado["proveedor"] not in ("No encontrado", "", None):
                         resultado["proveedor"] = pick_supplier_fuzzy(resultado["proveedor"])
@@ -418,11 +431,44 @@ def extract_with_regex(texto: str) -> dict:
     # Final
     resultado["proveedor"] = normalize_supplier_from_text(texto, resultado["proveedor"])
     resultado["proveedor"] = normalize_supplier_label(resultado["proveedor"], texto)
-    if is_geo_word(resultado["proveedor"]):
+    if is_geo_word(resultado["proveedor"]) or looks_like_geo_phrase(resultado["proveedor"]):
         resultado["proveedor"] = "No encontrado"
     if resultado["proveedor"] not in ("No encontrado", "", None):
         resultado["proveedor"] = pick_supplier_fuzzy(resultado["proveedor"])
     return resultado
+
+# =========================
+# Fallbacks por nombre de archivo
+# =========================
+def invoice_from_filename(fname: str) -> str:
+    base = pathlib.Path(fname).stem
+    cands = []
+    for pat in [
+        r'([A-Z]{1,3}-[A-Z0-9]{1,4}-\d{5,15})',
+        r'(FV[-/]?\d{1,2}[-/]?\d{5,10})',
+        r'([A-Z]\d{9,18})',
+        r'([A-Z]{2,5}[-/]?\d{3,12})'
+    ]:
+        m = re.search(pat, base, re.IGNORECASE)
+        if m:
+            cands.append(m.group(1))
+    if not cands:
+        return "No encontrado"
+    best = max(cands, key=lambda s: score_invoice(s))
+    return best if not invalid_invoice_like(best) else "No encontrado"
+
+def supplier_from_filename(fname: str) -> str:
+    if not fname:
+        return "No encontrado"
+    base = _norm(pathlib.Path(fname).stem)
+    toks = re.split(r'[\s._-]+', base)
+    for size in range(3, 0, -1):  # tríos, pares, uno
+        for i in range(len(toks)-size+1):
+            cand = " ".join(toks[i:i+size])
+            best = process.extractOne(cand, KNOWN_SUPPLIERS_CANON, scorer=fuzz.token_sort_ratio)
+            if best and best[1] >= 90:
+                return best[0]
+    return "No encontrado"
 
 # =========================
 # OpenAI: refuerzo y normalización
@@ -466,7 +512,7 @@ TEXTO:
 
         # Post-procesado proveedor
         prov = _norm(out["proveedor"])
-        if prov in STOPWORDS_SUPPLIER or is_geo_word(prov):
+        if prov in STOPWORDS_SUPPLIER or is_geo_word(prov) or looks_like_geo_phrase(prov):
             out["proveedor"] = "No encontrado"
         if any(t in prov for t in ["MISU","RINCON","TORTILLA","RESTAURANTE","BAR","CAFETERIA","TABERNA","ASADOR","PIZZERIA","HOTEL","HOSTAL"]):
             out["proveedor"] = "No encontrado"
@@ -488,7 +534,7 @@ TEXTO:
                 out["nro_factura"] = r_alt
             if re.fullmatch(r'\d{1,5}', (best or "")) and r_alt and r_alt != "No encontrado":
                 out["nro_factura"] = r_alt
-        # Evitar NIF/CIF/teléfono como factura
+        # Evitar NIF/CIF/teléfono/fecha como factura
         best_now = out["nro_factura"]
         alt = regex_result.get("nro_factura", "No encontrado")
         if invalid_invoice_like(best_now) and alt and alt != "No encontrado" and not invalid_invoice_like(alt):
@@ -502,10 +548,17 @@ TEXTO:
         # Normalizaciones fuertes + fuzzy + filtro geo
         out["proveedor"] = normalize_supplier_from_text(invoice_text, out["proveedor"])
         out["proveedor"] = normalize_supplier_label(out["proveedor"], invoice_text)
-        if is_geo_word(out["proveedor"]):
+        if is_geo_word(out["proveedor"]) or looks_like_geo_phrase(out["proveedor"]):
             out["proveedor"] = "No encontrado"
         if out["proveedor"] not in ("No encontrado", "", None):
             out["proveedor"] = pick_supplier_fuzzy(out["proveedor"])
+
+        # Fallback por nombre de archivo (proveedor)
+        fname = st.session_state.get("current_filename", "")
+        if out["proveedor"] == "No encontrado" and fname:
+            altp = supplier_from_filename(fname)
+            if altp != "No encontrado":
+                out["proveedor"] = altp
 
         st.write(f"✅ Final - Factura: {out['nro_factura']} | Proveedor: {out['proveedor']}")
         return out
@@ -515,26 +568,43 @@ TEXTO:
         st.write(f"Contenido recibido: {content}")
         regex_result["proveedor"] = normalize_supplier_from_text(invoice_text, regex_result["proveedor"])
         regex_result["proveedor"] = normalize_supplier_label(regex_result["proveedor"], invoice_text)
-        if is_geo_word(regex_result["proveedor"]):
+        if is_geo_word(regex_result["proveedor"]) or looks_like_geo_phrase(regex_result["proveedor"]):
             regex_result["proveedor"] = "No encontrado"
         if regex_result["proveedor"] not in ("No encontrado", "", None):
             regex_result["proveedor"] = pick_supplier_fuzzy(regex_result["proveedor"])
+
+        # Fallback proveedor por nombre de archivo
+        fname = st.session_state.get("current_filename", "")
+        if regex_result["proveedor"] == "No encontrado" and fname:
+            altp = supplier_from_filename(fname)
+            if altp != "No encontrado":
+                regex_result["proveedor"] = altp
+
         return regex_result
 
     except Exception as e:
         st.error(f"Error OpenAI: {e}")
         regex_result["proveedor"] = normalize_supplier_from_text(invoice_text, regex_result["proveedor"])
         regex_result["proveedor"] = normalize_supplier_label(regex_result["proveedor"], invoice_text)
-        if is_geo_word(regex_result["proveedor"]):
+        if is_geo_word(regex_result["proveedor"]) or looks_like_geo_phrase(regex_result["proveedor"]):
             regex_result["proveedor"] = "No encontrado"
         if regex_result["proveedor"] not in ("No encontrado", "", None):
             regex_result["proveedor"] = pick_supplier_fuzzy(regex_result["proveedor"])
+
+        # Fallback proveedor por nombre de archivo
+        fname = st.session_state.get("current_filename", "")
+        if regex_result["proveedor"] == "No encontrado" and fname:
+            altp = supplier_from_filename(fname)
+            if altp != "No encontrado":
+                regex_result["proveedor"] = altp
+
         return regex_result
 
 # =========================
 # Procesamiento de archivo (key único -> evita DuplicateWidgetID)
 # =========================
 def process_file(file, widget_key: str = "") -> dict:
+    st.session_state["current_filename"] = file.name  # → para fallbacks por nombre
     with tempfile.NamedTemporaryFile(delete=False, suffix=file.name) as tmp:
         tmp.write(file.read())
         tmp_path = pathlib.Path(tmp.name)
@@ -579,6 +649,13 @@ def process_file(file, widget_key: str = "") -> dict:
         )
 
     result = extract_data_with_openai(texto)
+
+    # Fallback Nº de factura desde el nombre del archivo (si es pobre o no encontrado)
+    if (result.get("nro_factura") in (None, "", "No encontrado")) or score_invoice(result["nro_factura"]) <= 1 or invalid_invoice_like(result["nro_factura"]):
+        alt_inv = invoice_from_filename(file.name)
+        if alt_inv != "No encontrado":
+            result["nro_factura"] = alt_inv
+
     return {"archivo": file.name, **result}
 
 # =========================
