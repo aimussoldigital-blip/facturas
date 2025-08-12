@@ -1,6 +1,8 @@
 # --- Lector de Facturas con OCR + OpenAI ---
-# Cloud: FIX keys únicos, proveedores (MAREGALEVILLA/SUPRACAFE/EHOSA),
-# filtro de localidades y mejor scoring del Nº de factura.
+# Cloud: OCR robusto (OpenCV + Tesseract multi-PSM), filtros NIF/CIF/teléfono,
+# filtro de localidades, fuzzy de proveedor y normalizaciones (MAREGALEVILLA/SUPRACAFE/EHOSA),
+# keys únicos en widgets y PDF/Excel de salida.
+
 import streamlit as st
 import pandas as pd
 import pytesseract
@@ -12,14 +14,16 @@ import pathlib
 import re
 import json
 import unicodedata
-import cv2
-import numpy as np
-from rapidfuzz import process, fuzz
-from PIL import Image, ImageOps, ImageEnhance, ImageFilter
+from PIL import Image
 from fpdf import FPDF
 from openai import OpenAI
 
-# ✅ Debe ser la primera llamada de Streamlit
+# Nuevas dependencias
+import cv2
+import numpy as np
+from rapidfuzz import process, fuzz
+
+# ✅ Siempre primero en Streamlit:
 st.set_page_config(page_title="OCR + OpenAI Facturas", layout="wide")
 
 # =========================
@@ -63,13 +67,12 @@ client = configurar_openai()
 st.sidebar.success("🧠 Tesseract: disponible" if TES_AVAILABLE else "⚠️ Tesseract: NO disponible")
 
 # =========================
-# Limpieza & Heurísticas
+# Reglas / Diccionarios
 # =========================
 STOPWORDS_SUPPLIER = {
     "FACTURA","FACT","INVOICE","ALBARAN","ALBARÁN","TICKET",
     "CLIENTE","DESTINATARIO","FACTURAR A","BILL TO","CUSTOMER",
     "FECHA","DATE","IVA","CIF","NIF","NIE","PAGINA","PÁGINA",
-    # Ruido de contacto / web
     "TEL","TLF","TLF.","TELEFONO","TELÉFONO","MOVIL","MÓVIL","FAX","EMAIL","E-MAIL","@","WEB","WWW","HTTP","HTTPS"
 }
 
@@ -81,7 +84,6 @@ CLIENT_HINTS = [
     r'CLIENTE:', r'CUSTOMER:', r'DESTINATARIO:', r'FACTURAR\s+A:', r'BILL\s+TO:'
 ]
 
-# Palabras frecuentes de localidades (para evitar tomarlas como proveedor)
 COMMON_GEO_WORDS = {
     "MADRID","GETAFE","VALLECAS","ATOCHA","ALCORCON","ALCORCÓN","MOSTOLES","MÓSTOLES",
     "BARCELONA","SEVILLA","VALENCIA","MALAGA","MÁLAGA","ZARAGOZA","BILBAO","TOLEDO",
@@ -90,7 +92,7 @@ COMMON_GEO_WORDS = {
     "TARRAGONA","CASTELLON","CASTELLÓN"
 }
 
-# Proveedores conocidos (incluye MAREGALEVILLA, SUPRACAFE, EHOSA, etc.)
+# Patrones conocidos de proveedores (detección inicial)
 KNOWN_SUPPLIERS = [
     r'MAREGALEVILLA', r'MARE\s*GALE\s*VILLA', r'WWW\.MAREGALEVILLA\.\w{2,}',
     r'SUPRACAFE', r'SUPRACAFÉ', r'SUPRA\s*CAFE', r'WWW\.SUPRACAFE\.\w{2,}',
@@ -101,8 +103,16 @@ KNOWN_SUPPLIERS = [
     r'ALIMENTACION\s+[A-ZÁÉÍÓÚÑ]+', r'DISTRIBUCIONES\s+[A-ZÁÉÍÓÚÑ]+',
     r'MAYORISTAS?\s+[A-ZÁÉÍÓÚÑ]+', r'SUMINISTROS?\s+[A-ZÁÉÍÓÚÑ]+',
 ]
-SHORT_VALID_SUPPLIERS = {"DIA"}  # siglas cortas válidas
+# Lista canónica para fuzzy
+KNOWN_SUPPLIERS_CANON = [
+    "SUPRACAFE", "MAREGALEVILLA", "EHOSA", "MERCADONA S.A.",
+    "COCA-COLA EUROPACIFIC PARTNERS"
+]
+SHORT_VALID_SUPPLIERS = {"DIA"}  # permitir siglas reales
 
+# =========================
+# Utilidades de normalización / validación
+# =========================
 def _norm(s: str) -> str:
     if not s:
         return ""
@@ -112,7 +122,8 @@ def _norm(s: str) -> str:
 
 def is_geo_word(s: str) -> bool:
     u = _norm(s).strip()
-    return (u in COMMON_GEO_WORDS) or (re.fullmatch(r'[A-ZÁÉÍÓÚÑ]{3,12}', u) and u not in SHORT_VALID_SUPPLIERS and u not in STOPWORDS_SUPPLIER)
+    return (u in COMMON_GEO_WORDS) or \
+           (re.fullmatch(r'[A-ZÁÉÍÓÚÑ]{3,12}', u) and u not in SHORT_VALID_SUPPLIERS and u not in STOPWORDS_SUPPLIER)
 
 def is_probably_supplier_line(s: str) -> bool:
     s_up = _norm(s).strip()
@@ -120,29 +131,22 @@ def is_probably_supplier_line(s: str) -> bool:
         return False
     if any(x in s_up for x in STOPWORDS_SUPPLIER):
         return False
-    if is_geo_word(s_up):  # ← evita localidades en mayúsculas
+    if is_geo_word(s_up):
         return False
-    # Bloquear siglas cortas tipo "ESB", salvo whitelist
     if len(s_up) <= 3 and s_up not in SHORT_VALID_SUPPLIERS:
         return False
-    # Evitar frases largas con verbos/legales
     if len(s_up) > 60:
         return False
     if re.search(r'\b(EJECUTAR|DERECHO|DEVOL|CONDICIONES|POLITICA|POLÍTICA|AVISO|LEGAL|PEDIDOS|ENVIO|ENVÍO|FORMA|PAGO)\b', s_up):
         return False
-    # Preferir forma jurídica o alto ratio de mayúsculas
     letters = [ch for ch in s_up if ch.isalpha()]
     caps_ratio = (sum(ch.isupper() for ch in letters) / max(1, len(letters))) if letters else 0
     if (" S.L" in s_up or " S.A" in s_up or re.search(r'\bS\.?L\.?\b|\bS\.?A\.?\b', s_up)) or caps_ratio > 0.6:
         return True
-    # Marcas razonables
     return 4 <= len(s_up) <= 24 and re.match(r'^[A-ZÁÉÍÓÚÑ0-9&\-\s\.]+$', s_up) is not None
 
 def normalize_supplier_from_text(full_text: str, current_supplier: str) -> str:
-    """
-    Prioriza MAREGALEVILLA si está en el documento (sobre 'Congelados El Gordo').
-    Mantiene normalizaciones de SUPRACAFE/EHOSA.
-    """
+    """Prioriza MAREGALEVILLA si aparece; mantiene SUPRACAFE/EHOSA; evita sobreescribir otros fuertes."""
     t = _norm(full_text)
     cur = _norm(current_supplier)
 
@@ -184,26 +188,67 @@ def normalize_supplier_label(label: str, full_text: str) -> str:
             return rep
     return label
 
-# =========================
-# OCR / Texto
-# =========================
-def preprocess(img: Image.Image) -> Image.Image:
-    if min(img.size) < 800:
-        scale = 800 / min(img.size)
-        img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
-    img = ImageOps.grayscale(img)
-    img = ImageEnhance.Contrast(img).enhance(2.0)
-    img = ImageEnhance.Sharpness(img).enhance(1.5)
-    img = img.filter(ImageFilter.MedianFilter(size=3))
-    return img.point(lambda x: 0 if x < 140 else 255, "1")
+def pick_supplier_fuzzy(candidate: str) -> str:
+    cand = _norm(candidate).strip()
+    if not cand or is_geo_word(cand):
+        return "No encontrado"
+    best = process.extractOne(cand, KNOWN_SUPPLIERS_CANON, scorer=fuzz.token_sort_ratio)
+    if best and best[1] >= 90:
+        return best[0]
+    # Bonito por defecto
+    return re.sub(r'\s+', ' ', candidate).strip().title()
 
-def ocr_image(img: Image.Image) -> str:
+# =========================
+# OCR robusto (OpenCV + multi-PSM + confianza)
+# =========================
+def preprocess_cv2(pil_img):
+    img = np.array(pil_img.convert("RGB"))[:, :, ::-1]  # PIL->BGR
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # Deskew (aprox.)
+    coords = np.column_stack(np.where(gray < 255))
+    angle = 0
+    if coords.size:
+        angle = cv2.minAreaRect(coords)[-1]
+        angle = -(90 + angle) if angle < -45 else -angle
+    (h, w) = gray.shape[:2]
+    M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+    gray = cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    # Binarización + limpieza
+    bw = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                               cv2.THRESH_BINARY, 35, 15)
+    bw = cv2.medianBlur(bw, 3)
+    return bw
+
+def ocr_image_conf(pil_img) -> str:
     if not TES_AVAILABLE:
         raise TesseractNotFoundError("Tesseract no está instalado en el servidor.")
-    img_proc = preprocess(img)
-    config = "--psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyzÁÉÍÓÚáéíóúÑñ.,:-/() "
-    return pytesseract.image_to_string(img_proc, lang="spa+eng", config=config)
+    bw = preprocess_cv2(pil_img)
+    best_text, best_score = "", -1
+    for psm in [6, 4, 11, 12, 13]:
+        cfg = f"--oem 1 --psm {psm}"
+        data = pytesseract.image_to_data(bw, lang="spa+eng", config=cfg, output_type=pytesseract.Output.DICT)
+        # Reconstrucción por líneas con confianza >=70
+        lines = {}
+        for i, conf in enumerate(data["conf"]):
+            try:
+                c = int(conf)
+            except:
+                c = -1
+            if c < 70:
+                continue
+            ln = (data["page_num"][i], data["block_num"][i], data["par_num"][i], data["line_num"][i])
+            token = (data["text"][i] or "").strip()
+            if token:
+                lines.setdefault(ln, []).append(token)
+        text = "\n".join(" ".join(t for t in toks if t.strip()) for toks in lines.values())
+        score = len(re.findall(r'(?:factura|invoice|n[º°o]|num|serie)', text, re.I)) * 5 + len(text)
+        if score > best_score:
+            best_text, best_score = text, score
+    return best_text or ""
 
+# =========================
+# Extracción de texto (PDF / Imagen)
+# =========================
 def text_from_pdf(path: pathlib.Path) -> str:
     doc = fitz.open(path)
     partes = []
@@ -212,10 +257,11 @@ def text_from_pdf(path: pathlib.Path) -> str:
         if len(emb) > 50:
             partes.append(emb)
         else:
+            # Sin texto nativo → OCR página
             if TES_AVAILABLE:
                 pix = page.get_pixmap(dpi=400)
                 with Image.open(io.BytesIO(pix.tobytes())) as im:
-                    partes.append(ocr_image(im))
+                    partes.append(ocr_image_conf(im))
             else:
                 partes.append(emb)
     doc.close()
@@ -235,61 +281,32 @@ def limpiar_texto(texto: str) -> str:
             lineas_limpias.append(linea_limpia)
     return "\n".join(lineas_limpias)
 
-def preprocess_cv2(pil_img):
-    img = np.array(pil_img.convert("RGB"))[:, :, ::-1]           # PIL->BGR
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    # Deskew (rápido)
-    coords = np.column_stack(np.where(gray < 255))
-    angle = 0
-    if coords.size:
-        angle = cv2.minAreaRect(coords)[-1]
-        angle = -(90 + angle) if angle < -45 else -angle
-    (h, w) = gray.shape[:2]
-    M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
-    gray = cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-    # Binarización + limpieza
-    bw = cv2.adaptiveThreshold(gray,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                               cv2.THRESH_BINARY,35,15)
-    bw = cv2.medianBlur(bw, 3)
-    return bw
-
-def ocr_image_conf(pil_img) -> str:
-    if not TES_AVAILABLE:
-        raise TesseractNotFoundError("Tesseract no está instalado en el servidor.")
-    bw = preprocess_cv2(pil_img)
-    best_text, best_score = "", -1
-    # probamos varios PSM y nos quedamos con el mejor
-    for psm in [6, 4, 11, 12, 13]:
-        cfg = f"--oem 1 --psm {psm}"
-        data = pytesseract.image_to_data(bw, lang="spa+eng", config=cfg, output_type=pytesseract.Output.DICT)
-        # reconstruir por líneas con conf >= 70
-        lines = {}
-        for i, conf in enumerate(data["conf"]):
-            try:
-                c = int(conf)
-            except:
-                c = -1
-            if c < 70:
-                continue
-            ln = (data["page_num"][i], data["block_num"][i], data["par_num"][i], data["line_num"][i])
-            lines.setdefault(ln, []).append(data["text"][i])
-        text = "\n".join(" ".join(t for t in toks if t.strip()) for toks in lines.values())
-        score = len(re.findall(r'(?:factura|invoice|n[º°o]|num|serie)', text, re.I)) * 5 + len(text)
-        if score > best_score:
-            best_text, best_score = text, score
-    return best_text or ""
-    
 # =========================
-# Helper: score para Nº de factura
+# Nº de factura: score y validadores
 # =========================
 def score_invoice(s: str) -> int:
     if not s or s == "No encontrado":
         return 0
     sc = 0
-    if re.search(r'[A-Z]', s): sc += 2
-    if '-' in s or '/' in s: sc += 2
-    if len(s.strip()) >= 6: sc += 1
+    s2 = s.strip()
+    if re.search(r'\b(FV|INV|AV|A-V|DGFC|BVRES|C\d{2,})[-/A-Z]?', s2, re.I): sc += 4
+    if re.search(r'[A-Z]', s2): sc += 2
+    if '-' in s2 or '/' in s2: sc += 2
+    if len(s2) >= 6: sc += 1
+    if re.fullmatch(r'\d{1,5}', s2): sc -= 2
     return sc
+
+def looks_like_nif(s: str) -> bool:
+    return re.fullmatch(r'\d{8}[A-Z]', s or "") is not None
+
+def looks_like_cif(s: str) -> bool:
+    return re.fullmatch(r'[ABCDEFGHJNPQRSUVW]\d{7}[0-9A-J]', s or "", re.I) is not None
+
+def looks_like_phone(s: str) -> bool:
+    return re.search(r'(\+34)?\s?\d{3}[\s-]?\d{2,3}[\s-]?\d{2,3}', s or "") is not None
+
+def invalid_invoice_like(s: str) -> bool:
+    return looks_like_nif(s) or looks_like_cif(s) or looks_like_phone(s)
 
 # =========================
 # Regex: factura / proveedor
@@ -317,7 +334,8 @@ def extract_with_regex(texto: str) -> dict:
             for match in matches:
                 if (len(match) >= 6 and not match.isalpha() and
                     not re.match(r'^M\d{4,6}$', match) and
-                    not re.match(r'^[A-Z]-?\d{8}[A-Z]?$', match, re.IGNORECASE)):
+                    not re.match(r'^[A-Z]-?\d{8}[A-Z]?$', match, re.IGNORECASE) and
+                    not invalid_invoice_like(match)):
                     resultado["nro_factura"] = match
                     st.write(f"✅ Factura encontrada con patrón {i+1}: {match}")
                     break
@@ -344,6 +362,8 @@ def extract_with_regex(texto: str) -> dict:
                 resultado["proveedor"] = normalize_supplier_label(resultado["proveedor"], texto)
                 if is_geo_word(resultado["proveedor"]):
                     resultado["proveedor"] = "No encontrado"
+                if resultado["proveedor"] not in ("No encontrado", "", None):
+                    resultado["proveedor"] = pick_supplier_fuzzy(resultado["proveedor"])
                 st.write(f"✅ Proveedor conocido: {resultado['proveedor']}")
                 return resultado
 
@@ -360,6 +380,8 @@ def extract_with_regex(texto: str) -> dict:
                 resultado["proveedor"] = normalize_supplier_label(resultado["proveedor"], texto)
                 if is_geo_word(resultado["proveedor"]):
                     resultado["proveedor"] = "No encontrado"
+                if resultado["proveedor"] not in ("No encontrado", "", None):
+                    resultado["proveedor"] = pick_supplier_fuzzy(resultado["proveedor"])
                 st.write(f"✅ Proveedor por dominio: {resultado['proveedor']}")
                 return resultado
 
@@ -388,6 +410,8 @@ def extract_with_regex(texto: str) -> dict:
                     resultado["proveedor"] = normalize_supplier_label(resultado["proveedor"], texto)
                     if is_geo_word(resultado["proveedor"]):
                         resultado["proveedor"] = "No encontrado"
+                    if resultado["proveedor"] not in ("No encontrado", "", None):
+                        resultado["proveedor"] = pick_supplier_fuzzy(resultado["proveedor"])
                     st.write(f"✅ Proveedor (general): {resultado['proveedor']}")
                     return resultado
 
@@ -396,6 +420,8 @@ def extract_with_regex(texto: str) -> dict:
     resultado["proveedor"] = normalize_supplier_label(resultado["proveedor"], texto)
     if is_geo_word(resultado["proveedor"]):
         resultado["proveedor"] = "No encontrado"
+    if resultado["proveedor"] not in ("No encontrado", "", None):
+        resultado["proveedor"] = pick_supplier_fuzzy(resultado["proveedor"])
     return resultado
 
 # =========================
@@ -438,8 +464,9 @@ TEXTO:
             "proveedor": (parsed.get("supplier") or "No encontrado").strip()
         }
 
+        # Post-procesado proveedor
         prov = _norm(out["proveedor"])
-        if prov in STOPWORDS_SUPPLIER:
+        if prov in STOPWORDS_SUPPLIER or is_geo_word(prov):
             out["proveedor"] = "No encontrado"
         if any(t in prov for t in ["MISU","RINCON","TORTILLA","RESTAURANTE","BAR","CAFETERIA","TABERNA","ASADOR","PIZZERIA","HOTEL","HOSTAL"]):
             out["proveedor"] = "No encontrado"
@@ -450,29 +477,35 @@ TEXTO:
         elif "EHOSA" in prov:
             out["proveedor"] = "EHOSA"
 
-        # Backoff y elección mejor nº de factura
+        # Elegir mejor nº de factura entre LLM y regex
         r_alt = regex_result.get("nro_factura", "No encontrado")
         if out["nro_factura"] == "No encontrado" and r_alt != "No encontrado":
             out["nro_factura"] = r_alt
             st.write(f"🔄 Usando regex para factura: {out['nro_factura']}")
         else:
-            # Comparar scores y preferir patrones fuertes
             best = out["nro_factura"]
             if score_invoice(r_alt) > score_invoice(best):
                 out["nro_factura"] = r_alt
             if re.fullmatch(r'\d{1,5}', (best or "")) and r_alt and r_alt != "No encontrado":
                 out["nro_factura"] = r_alt
+        # Evitar NIF/CIF/teléfono como factura
+        best_now = out["nro_factura"]
+        alt = regex_result.get("nro_factura", "No encontrado")
+        if invalid_invoice_like(best_now) and alt and alt != "No encontrado" and not invalid_invoice_like(alt):
+            out["nro_factura"] = alt
 
         # Backoff proveedor desde regex si LLM no lo encontró
         if out["proveedor"] == "No encontrado" and regex_result["proveedor"] != "No encontrado":
             out["proveedor"] = regex_result["proveedor"]
             st.write(f"🔄 Usando regex para proveedor: {out['proveedor']}")
 
-        # Normalizaciones fuertes
+        # Normalizaciones fuertes + fuzzy + filtro geo
         out["proveedor"] = normalize_supplier_from_text(invoice_text, out["proveedor"])
         out["proveedor"] = normalize_supplier_label(out["proveedor"], invoice_text)
         if is_geo_word(out["proveedor"]):
             out["proveedor"] = "No encontrado"
+        if out["proveedor"] not in ("No encontrado", "", None):
+            out["proveedor"] = pick_supplier_fuzzy(out["proveedor"])
 
         st.write(f"✅ Final - Factura: {out['nro_factura']} | Proveedor: {out['proveedor']}")
         return out
@@ -484,13 +517,18 @@ TEXTO:
         regex_result["proveedor"] = normalize_supplier_label(regex_result["proveedor"], invoice_text)
         if is_geo_word(regex_result["proveedor"]):
             regex_result["proveedor"] = "No encontrado"
+        if regex_result["proveedor"] not in ("No encontrado", "", None):
+            regex_result["proveedor"] = pick_supplier_fuzzy(regex_result["proveedor"])
         return regex_result
+
     except Exception as e:
         st.error(f"Error OpenAI: {e}")
         regex_result["proveedor"] = normalize_supplier_from_text(invoice_text, regex_result["proveedor"])
         regex_result["proveedor"] = normalize_supplier_label(regex_result["proveedor"], invoice_text)
         if is_geo_word(regex_result["proveedor"]):
             regex_result["proveedor"] = "No encontrado"
+        if regex_result["proveedor"] not in ("No encontrado", "", None):
+            regex_result["proveedor"] = pick_supplier_fuzzy(regex_result["proveedor"])
         return regex_result
 
 # =========================
@@ -509,6 +547,7 @@ def process_file(file, widget_key: str = "") -> dict:
             if not TES_AVAILABLE:
                 return {"archivo": file.name, "nro_factura": "Error: Tesseract no está instalado", "proveedor": "Error: Tesseract no está instalado"}
             imagen = Image.open(tmp_path)
+            # (rotación EXIF si existe)
             if hasattr(imagen, '_getexif'):
                 exif = imagen._getexif()
                 if exif is not None:
@@ -519,7 +558,7 @@ def process_file(file, widget_key: str = "") -> dict:
                         imagen = imagen.rotate(270, expand=True)
                     elif orientation == 8:
                         imagen = imagen.rotate(90, expand=True)
-            texto = ocr_image(imagen)
+            texto = ocr_image_conf(imagen)
     except Exception as e:
         return {"archivo": file.name, "nro_factura": f"Error: {e}", "proveedor": f"Error: {e}"}
     finally:
@@ -562,7 +601,7 @@ if st.sidebar.button("🧪 Test OpenAI"):
 with st.expander("ℹ️ Consejos"):
     st.markdown("""
 - **PDF nativo** da mejor resultado que imagen rasterizada.
-- Si subes **imágenes**, Tesseract debe estar instalado (ver packages.txt).
+- Si subes **imágenes**, Tesseract debe estar instalado (ver *packages.txt*).
 - El sistema identifica el **PROVEEDOR (emisor)**, no el cliente.
 """)
 
