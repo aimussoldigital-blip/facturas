@@ -12,6 +12,9 @@ import pathlib
 import re
 import json
 import unicodedata
+import cv2
+import numpy as np
+from rapidfuzz import process, fuzz
 from PIL import Image, ImageOps, ImageEnhance, ImageFilter
 from fpdf import FPDF
 from openai import OpenAI
