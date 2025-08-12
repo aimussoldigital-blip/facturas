@@ -1,4 +1,6 @@
-# --- Lector de Facturas con OCR + OpenAI (Cloud, FIX keys & proveedores) ---
+# --- Lector de Facturas con OCR + OpenAI ---
+# Cloud: FIX keys únicos, proveedores (MAREGALEVILLA/SUPRACAFE/EHOSA),
+# filtro de localidades y mejor scoring del Nº de factura.
 import streamlit as st
 import pandas as pd
 import pytesseract
@@ -76,6 +78,15 @@ CLIENT_HINTS = [
     r'CLIENTE:', r'CUSTOMER:', r'DESTINATARIO:', r'FACTURAR\s+A:', r'BILL\s+TO:'
 ]
 
+# Palabras frecuentes de localidades (para evitar tomarlas como proveedor)
+COMMON_GEO_WORDS = {
+    "MADRID","GETAFE","VALLECAS","ATOCHA","ALCORCON","ALCORCÓN","MOSTOLES","MÓSTOLES",
+    "BARCELONA","SEVILLA","VALENCIA","MALAGA","MÁLAGA","ZARAGOZA","BILBAO","TOLEDO",
+    "ALICANTE","CORDOBA","CÓRDOBA","VALLADOLID","GIJON","GIJÓN","LEGANES","LEGANÉS",
+    "PARLA","FUENLABRADA","RIVAS","MAJADAHONDA","ALCOBENDAS","SANSE","SAN SEBASTIAN",
+    "TARRAGONA","CASTELLON","CASTELLÓN"
+}
+
 # Proveedores conocidos (incluye MAREGALEVILLA, SUPRACAFE, EHOSA, etc.)
 KNOWN_SUPPLIERS = [
     r'MAREGALEVILLA', r'MARE\s*GALE\s*VILLA', r'WWW\.MAREGALEVILLA\.\w{2,}',
@@ -96,11 +107,17 @@ def _norm(s: str) -> str:
     s = "".join(c for c in s if not unicodedata.combining(c))
     return s.upper()
 
+def is_geo_word(s: str) -> bool:
+    u = _norm(s).strip()
+    return (u in COMMON_GEO_WORDS) or (re.fullmatch(r'[A-ZÁÉÍÓÚÑ]{3,12}', u) and u not in SHORT_VALID_SUPPLIERS and u not in STOPWORDS_SUPPLIER)
+
 def is_probably_supplier_line(s: str) -> bool:
     s_up = _norm(s).strip()
     if not s_up:
         return False
     if any(x in s_up for x in STOPWORDS_SUPPLIER):
+        return False
+    if is_geo_word(s_up):  # ← evita localidades en mayúsculas
         return False
     # Bloquear siglas cortas tipo "ESB", salvo whitelist
     if len(s_up) <= 3 and s_up not in SHORT_VALID_SUPPLIERS:
@@ -216,6 +233,18 @@ def limpiar_texto(texto: str) -> str:
     return "\n".join(lineas_limpias)
 
 # =========================
+# Helper: score para Nº de factura
+# =========================
+def score_invoice(s: str) -> int:
+    if not s or s == "No encontrado":
+        return 0
+    sc = 0
+    if re.search(r'[A-Z]', s): sc += 2
+    if '-' in s or '/' in s: sc += 2
+    if len(s.strip()) >= 6: sc += 1
+    return sc
+
+# =========================
 # Regex: factura / proveedor
 # =========================
 def extract_with_regex(texto: str) -> dict:
@@ -266,6 +295,8 @@ def extract_with_regex(texto: str) -> dict:
                 resultado["proveedor"] = l.strip()
                 resultado["proveedor"] = normalize_supplier_from_text(texto, resultado["proveedor"])
                 resultado["proveedor"] = normalize_supplier_label(resultado["proveedor"], texto)
+                if is_geo_word(resultado["proveedor"]):
+                    resultado["proveedor"] = "No encontrado"
                 st.write(f"✅ Proveedor conocido: {resultado['proveedor']}")
                 return resultado
 
@@ -280,6 +311,8 @@ def extract_with_regex(texto: str) -> dict:
                 resultado["proveedor"] = prov
                 resultado["proveedor"] = normalize_supplier_from_text(texto, resultado["proveedor"])
                 resultado["proveedor"] = normalize_supplier_label(resultado["proveedor"], texto)
+                if is_geo_word(resultado["proveedor"]):
+                    resultado["proveedor"] = "No encontrado"
                 st.write(f"✅ Proveedor por dominio: {resultado['proveedor']}")
                 return resultado
 
@@ -306,12 +339,16 @@ def extract_with_regex(texto: str) -> dict:
                     resultado["proveedor"] = cand
                     resultado["proveedor"] = normalize_supplier_from_text(texto, resultado["proveedor"])
                     resultado["proveedor"] = normalize_supplier_label(resultado["proveedor"], texto)
+                    if is_geo_word(resultado["proveedor"]):
+                        resultado["proveedor"] = "No encontrado"
                     st.write(f"✅ Proveedor (general): {resultado['proveedor']}")
                     return resultado
 
     # Final
     resultado["proveedor"] = normalize_supplier_from_text(texto, resultado["proveedor"])
     resultado["proveedor"] = normalize_supplier_label(resultado["proveedor"], texto)
+    if is_geo_word(resultado["proveedor"]):
+        resultado["proveedor"] = "No encontrado"
     return resultado
 
 # =========================
@@ -366,10 +403,20 @@ TEXTO:
         elif "EHOSA" in prov:
             out["proveedor"] = "EHOSA"
 
-        # Backoff a regex
-        if out["nro_factura"] == "No encontrado" and regex_result["nro_factura"] != "No encontrado":
-            out["nro_factura"] = regex_result["nro_factura"]
+        # Backoff y elección mejor nº de factura
+        r_alt = regex_result.get("nro_factura", "No encontrado")
+        if out["nro_factura"] == "No encontrado" and r_alt != "No encontrado":
+            out["nro_factura"] = r_alt
             st.write(f"🔄 Usando regex para factura: {out['nro_factura']}")
+        else:
+            # Comparar scores y preferir patrones fuertes
+            best = out["nro_factura"]
+            if score_invoice(r_alt) > score_invoice(best):
+                out["nro_factura"] = r_alt
+            if re.fullmatch(r'\d{1,5}', (best or "")) and r_alt and r_alt != "No encontrado":
+                out["nro_factura"] = r_alt
+
+        # Backoff proveedor desde regex si LLM no lo encontró
         if out["proveedor"] == "No encontrado" and regex_result["proveedor"] != "No encontrado":
             out["proveedor"] = regex_result["proveedor"]
             st.write(f"🔄 Usando regex para proveedor: {out['proveedor']}")
@@ -377,6 +424,8 @@ TEXTO:
         # Normalizaciones fuertes
         out["proveedor"] = normalize_supplier_from_text(invoice_text, out["proveedor"])
         out["proveedor"] = normalize_supplier_label(out["proveedor"], invoice_text)
+        if is_geo_word(out["proveedor"]):
+            out["proveedor"] = "No encontrado"
 
         st.write(f"✅ Final - Factura: {out['nro_factura']} | Proveedor: {out['proveedor']}")
         return out
@@ -386,15 +435,19 @@ TEXTO:
         st.write(f"Contenido recibido: {content}")
         regex_result["proveedor"] = normalize_supplier_from_text(invoice_text, regex_result["proveedor"])
         regex_result["proveedor"] = normalize_supplier_label(regex_result["proveedor"], invoice_text)
+        if is_geo_word(regex_result["proveedor"]):
+            regex_result["proveedor"] = "No encontrado"
         return regex_result
     except Exception as e:
         st.error(f"Error OpenAI: {e}")
         regex_result["proveedor"] = normalize_supplier_from_text(invoice_text, regex_result["proveedor"])
         regex_result["proveedor"] = normalize_supplier_label(regex_result["proveedor"], invoice_text)
+        if is_geo_word(regex_result["proveedor"]):
+            regex_result["proveedor"] = "No encontrado"
         return regex_result
 
 # =========================
-# Procesamiento de archivo (con key único para evitar DuplicateWidgetID)
+# Procesamiento de archivo (key único -> evita DuplicateWidgetID)
 # =========================
 def process_file(file, widget_key: str = "") -> dict:
     with tempfile.NamedTemporaryFile(delete=False, suffix=file.name) as tmp:
@@ -574,6 +627,7 @@ if files:
         file_name="facturas_procesadas.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+ 
 
 
 
