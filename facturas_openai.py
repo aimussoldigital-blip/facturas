@@ -1,4 +1,4 @@
-# --- Lector de Facturas con OCR + OpenAI (versión Cloud FIJA) ---
+# --- Lector de Facturas con OCR + OpenAI (Cloud, FIX set_page_config) ---
 import streamlit as st
 import pandas as pd
 import pytesseract
@@ -12,6 +12,9 @@ import json
 from PIL import Image, ImageOps, ImageEnhance, ImageFilter
 from fpdf import FPDF
 from openai import OpenAI
+
+# ✅ Debe ser la PRIMERA llamada de Streamlit
+st.set_page_config(page_title="OCR + OpenAI Facturas", layout="wide")
 
 # =========================
 # Entorno / Dependencias
@@ -116,20 +119,16 @@ KNOWN_SUPPLIERS = [
 ]
 
 def is_probably_supplier_line(s: str) -> bool:
-    """Heurística para evitar capturar frases/verbos y priorizar razón social."""
     s_up = s.upper().strip()
     if not s_up or any(x in s_up for x in STOPWORDS_SUPPLIER):
         return False
-    # Evitar frases largas con verbos comunes
     if len(s_up) > 60:
         return False
     if re.search(r'\b(EJECUTAR|DERECHO|DEVOL|CONDICIONES|POLITICA|POLÍTICA|AVISO|LEGAL|PEDIDOS|ENVIO|ENVÍO|FORMA|PAGO)\b', s_up):
         return False
-    # Preferir líneas con muchos caps o con forma jurídica
     caps_ratio = sum(ch.isupper() for ch in s_up if ch.isalpha()) / max(1, sum(ch.isalpha() for ch in s_up))
     if (" S.L" in s_up or " S.A" in s_up or " SL" in s_up or " SA" in s_up) or caps_ratio > 0.6:
         return True
-    # También permitir marcas cortas (EHOSA, MAKRO, etc.)
     if 3 <= len(s_up) <= 20 and re.match(r'^[A-ZÁÉÍÓÚÑ0-9&\-\s\.]+$', s_up):
         return True
     return False
@@ -140,7 +139,7 @@ def limpiar_texto(texto: str) -> str:
     for linea in lineas:
         if len(linea.strip()) < 3:
             continue
-        if re.search(r'^[A-Z]-?\d{8}[A-Z]?$', linea.strip(), re.IGNORECASE):  # NIF/NIE/CIF sueltos
+        if re.search(r'^[A-Z]-?\d{8}[A-Z]?$', linea.strip(), re.IGNORECASE):
             continue
         linea_limpia = re.sub(r'[^\w\s\-.,:/()áéíóúÁÉÍÓÚñÑ&]', ' ', linea)
         linea_limpia = re.sub(r'\s+', ' ', linea_limpia).strip()
@@ -273,7 +272,6 @@ TEXTO:
             "proveedor": (parsed.get("supplier") or "No encontrado").strip()
         }
 
-        # Filtros / normalizaciones
         prov = out["proveedor"].upper()
         if prov in STOPWORDS_SUPPLIER:
             out["proveedor"] = "No encontrado"
@@ -286,7 +284,6 @@ TEXTO:
         elif "EHOSA" in prov:
             out["proveedor"] = "EHOSA"
 
-        # Backoff a regex
         if out["nro_factura"] == "No encontrado" and regex_result["nro_factura"] != "No encontrado":
             out["nro_factura"] = regex_result["nro_factura"]
             st.write(f"🔄 Usando regex para factura: {out['nro_factura']}")
@@ -351,7 +348,6 @@ def process_file(file) -> dict:
 # =========================
 # UI
 # =========================
-st.set_page_config(page_title="OCR + OpenAI Facturas", layout="wide")
 st.title("📄 Lector de Facturas - OCR + OpenAI (Cloud)")
 st.markdown("Sube PDF o imágenes. Extrae Nº de Factura y Proveedor (emisor).")
 
@@ -467,18 +463,20 @@ if files:
         pdf.cell(60, 8, nro_factura, 1, 0, 'L')
         pdf.cell(60, 8, proveedor, 1, 1, 'L')
 
-    out = pdf.output(dest="S")   # bytes o bytearray en fpdf2
+    out = pdf.output(dest="S")
     pdf_bytes = bytes(out) if isinstance(out, (bytearray, bytes)) else out.encode("latin-1")
     st.download_button("📥 Descargar PDF", data=pdf_bytes, file_name="resumen_facturas.pdf", mime="application/pdf")
-    # -------- fin PDF --------
 
     # Excel
     excel_buf = io.BytesIO()
     df.to_excel(excel_buf, index=False, engine="openpyxl")
     excel_buf.seek(0)
-    st.download_button("📥 Descargar Excel", data=excel_buf.getvalue(),
-                       file_name="facturas_procesadas.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.download_button(
+        "📥 Descargar Excel",
+        data=excel_buf.getvalue(),
+        file_name="facturas_procesadas.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
 
 
