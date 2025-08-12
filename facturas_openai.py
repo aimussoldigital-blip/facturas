@@ -1,4 +1,4 @@
-# --- Lector de Facturas con OCR + OpenAI (Cloud, FIX set_page_config) ---
+# --- Lector de Facturas con OCR + OpenAI (Cloud, SUPRACAFE FIX) ---
 import streamlit as st
 import pandas as pd
 import pytesseract
@@ -9,6 +9,7 @@ import tempfile
 import pathlib
 import re
 import json
+import unicodedata
 from PIL import Image, ImageOps, ImageEnhance, ImageFilter
 from fpdf import FPDF
 from openai import OpenAI
@@ -57,6 +58,79 @@ client = configurar_openai()
 st.sidebar.success("🧠 Tesseract: disponible" if TES_AVAILABLE else "⚠️ Tesseract: NO disponible")
 
 # =========================
+# Limpieza & Heurísticas
+# =========================
+STOPWORDS_SUPPLIER = {
+    "FACTURA", "FACT", "INVOICE", "ALBARAN", "ALBARÁN", "TICKET",
+    "CLIENTE", "DESTINATARIO", "FACTURAR A", "BILL TO", "CUSTOMER",
+    "FECHA", "DATE", "IVA", "CIF", "NIF", "NIE", "PAGINA", "PÁGINA"
+}
+
+CLIENT_HINTS = [
+    r'MISU\s+\d+\s+S\.?L\.?', r'\bMISU\b',
+    r'RINCON\s+DE\s+LA\s+TORTILLA', r'EL\s+RINCON\s+DE\s+LA\s+TORTILLA',
+    r'RESTAURANTE\s+[A-ZÁÉÍÓÚÑ]+', r'BAR\s+[A-ZÁÉÍÓÚÑ]+', r'CAFETERIA\s+[A-ZÁÉÍÓÚÑ]+',
+    r'TABERNA\s+[A-ZÁÉÍÓÚÑ]+', r'ASADOR\s+[A-ZÁÉÍÓÚÑ]+', r'PIZZERIA\s+[A-ZÁÉÍÓÚÑ]+',
+    r'CLIENTE:', r'CUSTOMER:', r'DESTINATARIO:', r'FACTURAR\s+A:', r'BILL\s+TO:'
+]
+
+# Lista de proveedores conocidos (ampliada para Supracafé con variantes)
+KNOWN_SUPPLIERS = [
+    r'SUPRACAFE', r'SUPRACAFÉ', r'SUPRA\s*CAFE', r'WWW\.SUPRACAFE\.\w{2,}',
+    r'EHOSA', r'ELESPEJO\s+HOSTELEROS?\s*S\.?A\.?',
+    r'MERCADONA\s*S\.?A\.?', r'MAKRO', r'CARREFOUR', r'ALCAMPO', r'DIA\s*S\.?A\.?',
+    r'LIDL', r'ALDI', r'EROSKI', r'HIPERCOR', r'CORTE\s*INGLES', r'METRO\s*CASH',
+    r'ALIMENTACION\s+[A-ZÁÉÍÓÚÑ]+', r'DISTRIBUCIONES\s+[A-ZÁÉÍÓÚÑ]+',
+    r'MAYORISTAS?\s+[A-ZÁÉÍÓÚÑ]+', r'SUMINISTROS?\s+[A-ZÁÉÍÓÚÑ]+',
+]
+# Siglas cortas válidas (whitelist)
+SHORT_VALID_SUPPLIERS = {"DIA"}
+
+def _norm(s: str) -> str:
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return s.upper()
+
+def is_probably_supplier_line(s: str) -> bool:
+    s_up = _norm(s).strip()
+    if not s_up:
+        return False
+    # Bloquea palabras genéricas / metadatos
+    if any(x in s_up for x in STOPWORDS_SUPPLIER):
+        return False
+    # Bloquear siglas muy cortas en mayúsculas (e.g., "ESB"), excepto whitelist
+    if len(s_up) <= 3 and s_up not in SHORT_VALID_SUPPLIERS:
+        return False
+    # Evitar frases largas con verbos/legales
+    if len(s_up) > 60:
+        return False
+    if re.search(r'\b(EJECUTAR|DERECHO|DEVOL|CONDICIONES|POLITICA|POLÍTICA|AVISO|LEGAL|PEDIDOS|ENVIO|ENVÍO|FORMA|PAGO)\b', s_up):
+        return False
+    # Preferir forma jurídica o alto ratio de mayúsculas
+    letters = [ch for ch in s_up if ch.isalpha()]
+    caps_ratio = (sum(ch.isupper() for ch in letters) / max(1, len(letters))) if letters else 0
+    if (" S.L" in s_up or " S.A" in s_up or re.search(r'\bS\.?L\.?\b|\bS\.?A\.?\b', s_up)) or caps_ratio > 0.6:
+        return True
+    # Permitir marcas de 4–24 chars razonables
+    return 4 <= len(s_up) <= 24 and re.match(r'^[A-ZÁÉÍÓÚÑ0-9&\-\s\.]+$', s_up) is not None
+
+def normalize_supplier_from_text(full_text: str, current_supplier: str) -> str:
+    """
+    Si el texto contiene Supracafé en cualquiera de sus variantes,
+    fuerza el proveedor a 'SUPRACAFE' (salvo que ya se haya detectado otro conocido fuerte).
+    """
+    t = _norm(full_text)
+    cur = _norm(current_supplier)
+    if re.search(r'\bSUPRACAFE\b', t) or re.search(r'\bSUPRA\s*CAFE\b', t) or "WWW.SUPRACAFE." in t:
+        if (not cur) or ("NO ENCONTRADO" in cur) or (len(cur) <= 3) or (cur in STOPWORDS_SUPPLIER):
+            return "SUPRACAFE"
+        if not any(name in cur for name in ["MERCADONA", "CARREFOUR", "ALCAMPO", "EROSKI", "EHOSA", "MAKRO"]):
+            return "SUPRACAFE"
+    return current_supplier
+
+# =========================
 # OCR / Texto
 # =========================
 def preprocess(img: Image.Image) -> Image.Image:
@@ -92,46 +166,6 @@ def text_from_pdf(path: pathlib.Path) -> str:
                 partes.append(emb)
     doc.close()
     return "\n".join(partes)
-
-# =========================
-# Limpieza & Heurísticas
-# =========================
-STOPWORDS_SUPPLIER = {
-    "FACTURA", "FACT", "INVOICE", "ALBARAN", "ALBARÁN", "TICKET",
-    "CLIENTE", "DESTINATARIO", "FACTURAR A", "BILL TO", "CUSTOMER",
-    "FECHA", "DATE", "IVA", "CIF", "NIF", "NIE", "PAGINA", "PÁGINA"
-}
-
-CLIENT_HINTS = [
-    r'MISU\s+\d+\s+S\.?L\.?', r'\bMISU\b',
-    r'RINCON\s+DE\s+LA\s+TORTILLA', r'EL\s+RINCON\s+DE\s+LA\s+TORTILLA',
-    r'RESTAURANTE\s+[A-ZÁÉÍÓÚÑ]+', r'BAR\s+[A-ZÁÉÍÓÚÑ]+', r'CAFETERIA\s+[A-ZÁÉÍÓÚÑ]+',
-    r'TABERNA\s+[A-ZÁÉÍÓÚÑ]+', r'ASADOR\s+[A-ZÁÉÍÓÚÑ]+', r'PIZZERIA\s+[A-ZÁÉÍÓÚÑ]+',
-    r'CLIENTE:', r'CUSTOMER:', r'DESTINATARIO:', r'FACTURAR\s+A:', r'BILL\s+TO:'
-]
-
-KNOWN_SUPPLIERS = [
-    r'SUPRACAFE', r'SUPRACAFÉ', r'EHOSA', r'ELESPEJO\s+HOSTELEROS?\s*S\.?A\.?',
-    r'MERCADONA\s*S\.?A\.?', r'MAKRO', r'CARREFOUR', r'ALCAMPO', r'DIA\s*S\.?A\.?',
-    r'LIDL', r'ALDI', r'EROSKI', r'HIPERCOR', r'CORTE\s*INGLES', r'METRO\s*CASH',
-    r'ALIMENTACION\s+[A-ZÁÉÍÓÚÑ]+', r'DISTRIBUCIONES\s+[A-ZÁÉÍÓÚÑ]+',
-    r'MAYORISTAS?\s+[A-ZÁÉÍÓÚÑ]+', r'SUMINISTROS?\s+[A-ZÁÉÍÓÚÑ]+',
-]
-
-def is_probably_supplier_line(s: str) -> bool:
-    s_up = s.upper().strip()
-    if not s_up or any(x in s_up for x in STOPWORDS_SUPPLIER):
-        return False
-    if len(s_up) > 60:
-        return False
-    if re.search(r'\b(EJECUTAR|DERECHO|DEVOL|CONDICIONES|POLITICA|POLÍTICA|AVISO|LEGAL|PEDIDOS|ENVIO|ENVÍO|FORMA|PAGO)\b', s_up):
-        return False
-    caps_ratio = sum(ch.isupper() for ch in s_up if ch.isalpha()) / max(1, sum(ch.isalpha() for ch in s_up))
-    if (" S.L" in s_up or " S.A" in s_up or " SL" in s_up or " SA" in s_up) or caps_ratio > 0.6:
-        return True
-    if 3 <= len(s_up) <= 20 and re.match(r'^[A-ZÁÉÍÓÚÑ0-9&\-\s\.]+$', s_up):
-        return True
-    return False
 
 def limpiar_texto(texto: str) -> str:
     lineas = texto.split("\n")
@@ -194,6 +228,7 @@ def extract_with_regex(texto: str) -> dict:
         for pat in KNOWN_SUPPLIERS:
             if re.search(pat, l, re.IGNORECASE) and is_probably_supplier_line(l):
                 resultado["proveedor"] = l.strip()
+                resultado["proveedor"] = normalize_supplier_from_text(texto, resultado["proveedor"])
                 st.write(f"✅ Proveedor conocido: {resultado['proveedor']}")
                 return resultado
 
@@ -204,7 +239,8 @@ def extract_with_regex(texto: str) -> dict:
             prov = m.group(1).replace('-', ' ').upper()
             if prov and prov not in STOPWORDS_SUPPLIER and is_probably_supplier_line(prov):
                 resultado["proveedor"] = prov
-                st.write(f"✅ Proveedor por dominio: {prov}")
+                resultado["proveedor"] = normalize_supplier_from_text(texto, resultado["proveedor"])
+                st.write(f"✅ Proveedor por dominio: {resultado['proveedor']}")
                 return resultado
 
     # 3) Patrón general de empresa
@@ -224,12 +260,15 @@ def extract_with_regex(texto: str) -> dict:
             m = re.search(pat, l)
             if m:
                 cand = m.group(1).strip()
-                cup = cand.upper()
+                cup = _norm(cand)
                 if cup not in STOPWORDS_SUPPLIER and is_probably_supplier_line(cand) and not any(re.search(t, cand, re.IGNORECASE) for t in CLIENT_HINTS):
                     resultado["proveedor"] = cand
-                    st.write(f"✅ Proveedor (general): {cand}")
+                    resultado["proveedor"] = normalize_supplier_from_text(texto, resultado["proveedor"])
+                    st.write(f"✅ Proveedor (general): {resultado['proveedor']}")
                     return resultado
 
+    # Final
+    resultado["proveedor"] = normalize_supplier_from_text(texto, resultado["proveedor"])
     return resultado
 
 # =========================
@@ -272,18 +311,20 @@ TEXTO:
             "proveedor": (parsed.get("supplier") or "No encontrado").strip()
         }
 
-        prov = out["proveedor"].upper()
+        # Filtros / normalizaciones
+        prov = _norm(out["proveedor"])
         if prov in STOPWORDS_SUPPLIER:
             out["proveedor"] = "No encontrado"
         if any(t in prov for t in ["MISU", "RINCON", "TORTILLA", "RESTAURANTE", "BAR", "CAFETERIA", "TABERNA", "ASADOR", "PIZZERIA", "HOTEL", "HOSTAL"]):
             out["proveedor"] = "No encontrado"
         if "MERCADONA" in prov:
             out["proveedor"] = "MERCADONA S.A."
-        elif "SUPRACAFE" in prov or "SUPRACAFÉ" in prov:
+        elif "SUPRACAFE" in prov:
             out["proveedor"] = "SUPRACAFE"
         elif "EHOSA" in prov:
             out["proveedor"] = "EHOSA"
 
+        # Backoff a regex
         if out["nro_factura"] == "No encontrado" and regex_result["nro_factura"] != "No encontrado":
             out["nro_factura"] = regex_result["nro_factura"]
             st.write(f"🔄 Usando regex para factura: {out['nro_factura']}")
@@ -291,15 +332,21 @@ TEXTO:
             out["proveedor"] = regex_result["proveedor"]
             st.write(f"🔄 Usando regex para proveedor: {out['proveedor']}")
 
+        # Normalización fuerte por contenido del documento (SUPRACAFE)
+        out["proveedor"] = normalize_supplier_from_text(invoice_text, out["proveedor"])
+
         st.write(f"✅ Final - Factura: {out['nro_factura']} | Proveedor: {out['proveedor']}")
         return out
 
     except json.JSONDecodeError as e:
         st.warning(f"Error JSON OpenAI: {e}")
         st.write(f"Contenido recibido: {content}")
+        # Normalizar también salida de respaldo
+        regex_result["proveedor"] = normalize_supplier_from_text(invoice_text, regex_result["proveedor"])
         return regex_result
     except Exception as e:
         st.error(f"Error OpenAI: {e}")
+        regex_result["proveedor"] = normalize_supplier_from_text(invoice_text, regex_result["proveedor"])
         return regex_result
 
 # =========================
@@ -463,7 +510,7 @@ if files:
         pdf.cell(60, 8, nro_factura, 1, 0, 'L')
         pdf.cell(60, 8, proveedor, 1, 1, 'L')
 
-    out = pdf.output(dest="S")
+    out = pdf.output(dest="S")   # bytes o bytearray en fpdf2
     pdf_bytes = bytes(out) if isinstance(out, (bytearray, bytes)) else out.encode("latin-1")
     st.download_button("📥 Descargar PDF", data=pdf_bytes, file_name="resumen_facturas.pdf", mime="application/pdf")
 
