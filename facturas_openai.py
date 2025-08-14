@@ -23,8 +23,8 @@ st.set_page_config(page_title="OCR + OpenAI Facturas", layout="wide")
 # =========================
 # PDF desde DataFrame (siempre bytes)
 # =========================
-def create_pdf_report(df: pd.DataFrame) -> bytes:
-    """Genera un PDF con nro_factura y proveedor. Siempre devuelve bytes."""
+def create_pdf_report(df: pd.DataFrame):
+    """Genera un PDF con nro_factura y proveedor."""
     try:
         from reportlab.lib.pagesizes import A4
         from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
@@ -58,7 +58,7 @@ def create_pdf_report(df: pd.DataFrame) -> bytes:
         elements.append(table)
         doc.build(elements)
         buffer.seek(0)
-        return buffer.getvalue()
+        return buffer  # devolvemos BytesIO
 
     except Exception:
         try:
@@ -71,9 +71,11 @@ def create_pdf_report(df: pd.DataFrame) -> bytes:
                 pdf.cell(90, 8, str(row.get("nro_factura", "")), 1)
                 pdf.cell(90, 8, str(row.get("proveedor", "")), 1, ln=True)
             out = pdf.output(dest="S")
-            return out if isinstance(out, (bytes, bytearray)) else out.encode("latin-1")
+            if not isinstance(out, (bytes, bytearray)):
+                out = out.encode("latin-1")
+            return io.BytesIO(out)
         except Exception:
-            return b"%PDF-1.4\n%EOF"  # PDF mínimo válido
+            return io.BytesIO(b"%PDF-1.4\n%EOF")  # PDF mínimo válido
 
 # =========================
 # Dependencias y Config OpenAI
@@ -257,11 +259,16 @@ if uploaded_files:
                            file_name="facturas.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-        # PDF
-        pdf_bytes = create_pdf_report(df)
-        if not isinstance(pdf_bytes, (bytes, bytearray)):
-            pdf_bytes = b"%PDF-1.4\n%EOF"
-        st.download_button("📑 Descargar PDF", data=pdf_bytes,
+        # PDF (con conversión segura a bytes)
+        pdf_data = create_pdf_report(df)
+        if hasattr(pdf_data, "getvalue"):
+            pdf_data = pdf_data.getvalue()
+        elif isinstance(pdf_data, memoryview):
+            pdf_data = pdf_data.tobytes()
+        elif not isinstance(pdf_data, (bytes, bytearray)):
+            pdf_data = b"%PDF-1.4\n%EOF"
+
+        st.download_button("📑 Descargar PDF", data=pdf_data,
                            file_name="facturas.pdf", mime="application/pdf")
 
 
