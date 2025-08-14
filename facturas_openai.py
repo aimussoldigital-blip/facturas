@@ -1,6 +1,4 @@
-# --- Lector de Facturas con OCR + OpenAI (MEJORADO) ---
-# Mejoras: patrones más robustos, mejor preprocesamiento OCR,
-# lógica simplificada y tolerante para detección de proveedores, y fixes de sintaxis.
+# --- Lector de Facturas con OCR + OpenAI (UI simplificada) ---
 
 import streamlit as st
 import pandas as pd
@@ -22,17 +20,16 @@ import cv2
 import numpy as np
 from rapidfuzz import process, fuzz
 
-# ✅ Siempre primero en Streamlit:
+# ✅ Config básica
 st.set_page_config(page_title="OCR + OpenAI Facturas", layout="wide")
 
 # =========================
-# Reporte PDF (reportlab si está; si no, FPDF)
+# PDF (desde DataFrame con 2 columnas)
 # =========================
-def create_pdf_report(results: list) -> bytes:
-    """Crea un reporte PDF con tabla de resultados."""
+def create_pdf_report(df: pd.DataFrame) -> bytes:
+    """Crea un PDF con las columnas nro_factura y proveedor."""
     buffer = io.BytesIO()
     try:
-        # Importar aquí para que sea opcional
         from reportlab.lib.pagesizes import A4
         from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -45,34 +42,26 @@ def create_pdf_report(results: list) -> bytes:
         )
         styles = getSampleStyleSheet()
         title_style = ParagraphStyle(
-            'CustomTitle',
-            parent=styles['Heading1'],
-            fontSize=18,
-            spaceAfter=20,
-            alignment=1  # centrado
+            'CustomTitle', parent=styles['Heading1'], fontSize=18, spaceAfter=20, alignment=1
         )
 
         elements = []
-        elements.append(Paragraph("REPORTE DE FACTURAS PROCESADAS", title_style))
+        elements.append(Paragraph("REPORTE DE FACTURAS (Nº + PROVEEDOR)", title_style))
         elements.append(Spacer(1, 12))
 
-        # Cabeceras
-        data = [['ARCHIVO', 'NÚMERO FACTURA', 'PROVEEDOR']]
+        data = [["NÚMERO FACTURA", "PROVEEDOR"]]
+        for _, row in df.iterrows():
+            factura = str(row.get("nro_factura", "")).strip()
+            proveedor = str(row.get("proveedor", "")).strip()
+            if len(factura) > 35: factura = factura[:32] + "..."
+            if len(proveedor) > 50: proveedor = proveedor[:47] + "..."
+            data.append([factura, proveedor])
 
-        for r in results:
-            archivo = r['archivo']
-            if len(archivo) > 30: archivo = archivo[:27] + "..."
-            factura = str(r.get('nro_factura', ''))
-            if len(factura) > 25: factura = factura[:22] + "..."
-            proveedor = str(r.get('proveedor', ''))
-            if len(proveedor) > 35: proveedor = proveedor[:32] + "..."
-            data.append([archivo, factura, proveedor])
-
-        table = Table(data, colWidths=[2.2*inch, 2.2*inch, 2.2*inch])
-        table_style = TableStyle([
+        table = Table(data, colWidths=[2.5*inch, 3.5*inch])
+        table.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#4A4A4A")),
             ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
             ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
             ('FONTSIZE', (0, 0), (-1, 0), 12),
             ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
@@ -81,47 +70,30 @@ def create_pdf_report(results: list) -> bytes:
             ('FONTSIZE', (0, 1), (-1, -1), 10),
             ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
             ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-        ])
-        table.setStyle(table_style)
+        ]))
         elements.append(table)
-
-        elements.append(Spacer(1, 16))
-        facturas_ok = sum(1 for r in results if r.get("nro_factura") not in ["No encontrado"] and not str(r.get("nro_factura")).startswith("Error:"))
-        proveedores_ok = sum(1 for r in results if r.get("proveedor") not in ["No encontrado"] and not str(r.get("proveedor")).startswith("Error:"))
-        stats_text = f"Resumen: {facturas_ok} facturas detectadas, {proveedores_ok} proveedores identificados de {len(results)} archivos procesados."
-        elements.append(Paragraph(stats_text, styles['Normal']))
-
         doc.build(elements)
         buffer.seek(0)
         return buffer.getvalue()
 
     except Exception:
-        # Fallback: FPDF
+        # Fallback FPDF
         pdf = FPDF()
         pdf.add_page()
         pdf.set_font('Arial', 'B', 16)
-        pdf.cell(0, 10, 'REPORTE DE FACTURAS PROCESADAS', ln=True, align='C')
+        pdf.cell(0, 10, 'REPORTE DE FACTURAS (Nº + PROVEEDOR)', ln=True, align='C')
         pdf.ln(8)
-        pdf.set_font('Arial', 'B', 10)
-        pdf.cell(60, 8, 'ARCHIVO', 1, 0, 'C')
-        pdf.cell(60, 8, 'NUMERO FACTURA', 1, 0, 'C')
-        pdf.cell(60, 8, 'PROVEEDOR', 1, 1, 'C')
-        pdf.set_font('Arial', '', 9)
-        for r in results:
-            archivo = r['archivo'][:25] + "..." if len(r['archivo']) > 25 else r['archivo']
-            factura = str(r.get('nro_factura', ''))[:20] + "..." if len(str(r.get('nro_factura', ''))) > 20 else str(r.get('nro_factura', ''))
-            proveedor = str(r.get('proveedor', ''))[:25] + "..." if len(str(r.get('proveedor', ''))) > 25 else str(r.get('proveedor', ''))
-            pdf.cell(60, 8, archivo, 1, 0, 'L')
-            pdf.cell(60, 8, factura, 1, 0, 'L')
-            pdf.cell(60, 8, proveedor, 1, 1, 'L')
-
-        pdf.ln(8)
-        facturas_ok = sum(1 for r in results if r.get("nro_factura") not in ["No encontrado"] and not str(r.get("nro_factura")).startswith("Error:"))
-        proveedores_ok = sum(1 for r in results if r.get("proveedor") not in ["No encontrado"] and not str(r.get("proveedor")).startswith("Error:"))
+        pdf.set_font('Arial', 'B', 11)
+        pdf.cell(90, 8, 'NÚMERO FACTURA', 1, 0, 'C')
+        pdf.cell(90, 8, 'PROVEEDOR', 1, 1, 'C')
         pdf.set_font('Arial', '', 10)
-        pdf.cell(0, 6, f'Resumen: {facturas_ok} facturas detectadas, {proveedores_ok} proveedores identificados', ln=True)
-        pdf.cell(0, 6, f'de {len(results)} archivos procesados.', ln=True)
-
+        for _, row in df.iterrows():
+            factura = str(row.get("nro_factura", ""))
+            proveedor = str(row.get("proveedor", ""))
+            factura = (factura[:42] + "...") if len(factura) > 45 else factura
+            proveedor = (proveedor[:42] + "...") if len(proveedor) > 45 else proveedor
+            pdf.cell(90, 8, factura, 1, 0, 'L')
+            pdf.cell(90, 8, proveedor, 1, 1, 'L')
         out = pdf.output(dest="S")
         return out if isinstance(out, (bytes, bytearray)) else out.encode("latin-1")
 
@@ -139,47 +111,33 @@ TES_AVAILABLE = has_tesseract()
 
 # --- Configuración de OpenAI ---
 def configurar_openai():
-    st.sidebar.write("🔍 Debug - Secrets:")
     try:
-        available_keys = list(st.secrets.keys())
-        st.sidebar.write(f"Keys encontradas: {available_keys}")
+        for key_name in ["openai_api_key","OPENAI_API_KEY","openai-api-key","openai_key","OPENAI_KEY","api_key"]:
+            try:
+                api_key = st.secrets[key_name]
+                return OpenAI(api_key=api_key)
+            except KeyError:
+                continue
     except Exception:
-        st.sidebar.write("No se pudieron leer los secrets")
-
-    for key_name in ["openai_api_key","OPENAI_API_KEY","openai-api-key","openai_key","OPENAI_KEY","api_key"]:
-        try:
-            api_key = st.secrets[key_name]
-            client = OpenAI(api_key=api_key)
-            st.sidebar.success(f"✅ OpenAI configurado con key: '{key_name}'")
-            return client
-        except KeyError:
-            continue
-        except Exception as e:
-            st.sidebar.error(f"Error con key '{key_name}': {e}")
-            continue
-
+        pass
     st.error("❌ No se encontró la API key de OpenAI")
-    st.info("Manage app → Settings → Secrets → agrega:\n\nopenai_api_key = \"sk-...\"")
     st.stop()
 
 client = configurar_openai()
-st.sidebar.success("🧠 Tesseract: disponible" if TES_AVAILABLE else "⚠️ Tesseract: NO disponible")
 
 # =========================
 # Patrones mejorados
 # =========================
 INVOICE_PATTERNS = [
     r'\b(?:FACT(?:URA)?\.?\s*N[ºo°]?\.?\s*|N[ºo°]\.?\s*FACT(?:URA)?\.?\s*|INVOICE\s*(?:N[ºo°])?\.?\s*|FACTURE\s*N[ºo°]\.?\s*)([A-Z0-9][A-Z0-9\-/\.]{3,20})\b',
-    r'\b([A-Z]{1,4}[-/]\d{4,12})\b',          # FV-123456, A-123456
-    r'\b([A-Z]\d{8,15})\b',                   # C123456789, E123456789
-    r'\b(FV[-/]?\d{1,3}[-/]?\d{4,12})\b',     # FV-0-123456
-    r'\b([A-Z]{2,5}\d{3,12})\b',              # INV123456
-    r'\b(\d{7,12})\b',                        # solo números largos
+    r'\b([A-Z]{1,4}[-/]\d{4,12})\b',
+    r'\b([A-Z]\d{8,15})\b',
+    r'\b(FV[-/]?\d{1,3}[-/]?\d{4,12})\b',
+    r'\b([A-Z]{2,5}\d{3,12})\b',
+    r'\b(\d{7,12})\b',
     r'\b([A-Z0-9]{1,4}[-/][A-Z0-9]{1,4}[-/][A-Z0-9]{3,12})\b',
-    r'\b(\d{4}[-/]\d{6,10})\b',               # 2024-123456
+    r'\b(\d{4}[-/]\d{6,10})\b',
 ]
-
-INVOICE_CONTEXT_WORDS = ['FACTURA','FACT','INVOICE','FACTURE','BILL','RECEIPT','NÚMERO','NUMERO','Nº','N°','NO','NUMBER','#']
 INVALID_INVOICE_WORDS = ['CLIENTE','CLIENT','CUSTOMER','DESTINATARIO','FECHA','DATE','TELEFONO','TELÉFONO','PHONE','EMAIL','DIRECCION','ADDRESS','CIF','NIF','VAT','IVA']
 
 KNOWN_SUPPLIERS_PATTERNS = [
@@ -194,7 +152,7 @@ KNOWN_SUPPLIERS_PATTERNS = [
     r'\b(MAREGALEVILLA|MARE\s*GALE\s*VILLA)\b',
     r'\b(EHOSA)\b',
     r'\b(COCA\s*COLA)\b',
-    r'\b([A-ZÁÉÍÓÚÑ][A-Za-záéíóúñ\s]{2,}\s+S\.?[LA]\.?)\b',  # Empresa con S.L./S.A.
+    r'\b([A-ZÁÉÍÓÚÑ][A-Za-záéíóúñ\s]{2,}\s+S\.?[LA]\.?)\b',
 ]
 
 # =========================
@@ -215,11 +173,11 @@ def is_valid_invoice_number(candidate: str) -> bool:
         return False
     if candidate.isdigit() and len(candidate) < 6:
         return False
-    if re.match(r'^\d{8}[A-Z]$', candidate) or re.match(r'^[A-Z]\d{7}[0-9A-J]$', candidate):  # NIF/CIF
+    if re.match(r'^\d{8}[A-Z]$', candidate) or re.match(r'^[A-Z]\d{7}[0-9A-J]$', candidate):
         return False
-    if re.match(r'^\+?[\d\s\-]{9,15}$', candidate):  # teléfono
+    if re.match(r'^\+?[\d\s\-]{9,15}$', candidate):
         return False
-    if re.match(r'^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$', candidate):  # fecha
+    if re.match(r'^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$', candidate):
         return False
     return True
 
@@ -264,7 +222,6 @@ def extract_text_with_ocr(pil_img) -> str:
     if not TES_AVAILABLE:
         raise TesseractNotFoundError("Tesseract no está disponible")
     processed_img = preprocess_image_advanced(pil_img)
-    # Pasar a PIL por compatibilidad total con pytesseract
     processed_pil = Image.fromarray(processed_img)
     best_text, best_score = "", 0
     for psm in [6, 4, 11, 12, 3]:
@@ -274,8 +231,8 @@ def extract_text_with_ocr(pil_img) -> str:
             score = len(text) + text.upper().count('FACTURA') * 10 + text.upper().count('INVOICE') * 10
             if score > best_score:
                 best_text, best_score = text, score
-        except Exception as e:
-            st.warning(f"Error con PSM {psm}: {e}")
+        except Exception:
+            pass
     return best_text
 
 # =========================
@@ -294,7 +251,6 @@ def extract_invoice_number(text: str) -> str:
                 context = text[start:end]
                 score = score_invoice_number(candidate, context)
                 candidates.append((candidate, score))
-    # contexto por líneas
     lines = text.split('\n')
     for i, line in enumerate(lines):
         line_norm = normalize_text(line)
@@ -313,12 +269,10 @@ def extract_invoice_number(text: str) -> str:
     return "No encontrado"
 
 def extract_supplier(text: str) -> str:
-    """Extrae el proveedor del texto (corrigido; bloque previo estaba cortado)."""
     if not text:
         return "No encontrado"
 
     text_upper = normalize_text(text)
-    # 1) mapping directo (rápido)
     known_suppliers_map = {
         'OUIGO': 'OUIGO ESPAÑA S.A.U.',
         'SUPRACAFE': 'SUPRACAFE',
@@ -337,7 +291,6 @@ def extract_supplier(text: str) -> str:
         if k in text_upper:
             return v
 
-    # 2) patrones conocidos
     for pat in KNOWN_SUPPLIERS_PATTERNS:
         m = re.search(pat, text, re.IGNORECASE)
         if m:
@@ -345,7 +298,6 @@ def extract_supplier(text: str) -> str:
             cand = re.sub(r'\s+', ' ', cand).strip()
             return cand
 
-    # 3) heurística en primeras líneas
     lines = [ln.strip() for ln in text.split('\n') if ln.strip()]
     skip_terms = {'FACTURA','INVOICE','FECHA','DATE','CLIENTE','CUSTOMER','TELEFONO','TELÉFONO',
                   'EMAIL','DIRECCION','ADDRESS','CIF','NIF','PUEDES PAGAR','PAGAR ONLINE',
@@ -354,7 +306,6 @@ def extract_supplier(text: str) -> str:
         u = normalize_text(line)
         if any(t in u for t in skip_terms):
             continue
-        # nombre corporativo típico
         if (re.search(r'\bS\.?A\.?U?\.?\b', u) or
             re.search(r'\bS\.?L\.?U?\.?\b', u) or
             re.search(r'\bLIMITADA\b', u) or
@@ -364,20 +315,15 @@ def extract_supplier(text: str) -> str:
             re.search(r'\bLTD\b', u)):
             cleaned = re.sub(r'\s+', ' ', line).strip()
             return cleaned[:60] + '...' if len(cleaned) > 60 else cleaned
-
-        # nombre comercial en mayúsculas razonable
         if 4 <= len(u) <= 50 and re.match(r'^[A-ZÁÉÍÓÚÑ0-9&\-\.\s]+$', u):
-            # evitar cosas tipo dirección
             if not re.search(r'\bCALLE\b|\bAVDA\b|\bC/\b|\bEUROS?\b|\b€\b|\d{2}[/-]\d{2}[/-]\d{2,4}', u):
                 return line
-
     return "No encontrado"
 
 # =========================
-# Procesamiento con OpenAI mejorado
+# OpenAI (combinado, sin debug visual)
 # =========================
 def extract_data_with_openai_improved(text: str) -> dict:
-    """Extrae datos usando OpenAI con prompt mejorado."""
     regex_invoice = extract_invoice_number(text)
     regex_supplier = extract_supplier(text)
 
@@ -386,17 +332,15 @@ def extract_data_with_openai_improved(text: str) -> dict:
 
     prompt = f"""
 Eres un experto analizando facturas españolas. Extrae EXACTAMENTE estos datos:
+1. NÚMERO DE FACTURA
+2. PROVEEDOR (emisor)
 
-1. NÚMERO DE FACTURA: El código único que identifica esta factura (puede tener letras, números, guiones)
-2. PROVEEDOR: El nombre de la empresa que EMITE la factura (NO el cliente que la recibe)
+Reglas:
+- No NIF/CIF/teléfono/fechas como número de factura
+- Si no hay dato, usa "No encontrado"
+- Responde SOLO en JSON
 
-REGLAS IMPORTANTES:
-- NO extraigas NIFs, CIFs, teléfonos o fechas como números de factura
-- El proveedor es quien VENDE, no quien COMPRA
-- Si no encuentras algo, responde "No encontrado"
-- Responde SOLO en formato JSON
-
-TEXTO DE LA FACTURA:
+TEXTO:
 {relevant_text}
 
 Respuesta JSON:
@@ -425,7 +369,6 @@ Respuesta JSON:
             if len(ai_supplier) > 60:
                 ai_supplier = ai_supplier[:60].strip()
 
-        # Combinar (elige el mejor puntaje)
         final_invoice = ai_invoice
         if ai_invoice == "No encontrado" and regex_invoice != "No encontrado":
             final_invoice = regex_invoice
@@ -435,21 +378,15 @@ Respuesta JSON:
 
         final_supplier = ai_supplier if ai_supplier != "No encontrado" else regex_supplier
 
-        st.write(f"🤖 AI - Factura: {ai_invoice}, Proveedor: {ai_supplier}")
-        st.write(f"🔧 Regex - Factura: {regex_invoice}, Proveedor: {regex_supplier}")
-        st.write(f"✅ Final - Factura: {final_invoice}, Proveedor: {final_supplier}")
-
         return {"nro_factura": final_invoice, "proveedor": final_supplier}
 
-    except Exception as e:
-        st.warning(f"Error con OpenAI: {e}")
+    except Exception:
         return {"nro_factura": regex_invoice, "proveedor": regex_supplier}
 
 # =========================
 # I/O de archivos
 # =========================
 def extract_text_from_file(file_path: pathlib.Path) -> str:
-    """Extrae texto de PDF o imagen."""
     try:
         if file_path.suffix.lower() == '.pdf':
             doc = fitz.open(file_path)
@@ -484,7 +421,6 @@ def extract_text_from_file(file_path: pathlib.Path) -> str:
         raise Exception(f"Error procesando archivo: {e}")
 
 def process_single_file(file, index: int) -> dict:
-    """Procesa un solo archivo subido."""
     with tempfile.NamedTemporaryFile(delete=False, suffix=pathlib.Path(file.name).suffix) as tmp_file:
         tmp_file.write(file.read())
         tmp_path = pathlib.Path(tmp_file.name)
@@ -492,11 +428,6 @@ def process_single_file(file, index: int) -> dict:
         text = extract_text_from_file(tmp_path)
         if not text or not text.strip():
             return {"archivo": file.name, "nro_factura": "Error: No se pudo extraer texto", "proveedor": "Error: No se pudo extraer texto"}
-
-        # Debug opcional
-        with st.expander(f"🔍 Texto extraído - {file.name}"):
-            st.text_area("Primeras líneas:", text[:1000], height=200, key=f"debug_text_{index}_{file.name}")
-
         result = extract_data_with_openai_improved(text)
         return {"archivo": file.name, **result}
     except Exception as e:
@@ -510,32 +441,7 @@ def process_single_file(file, index: int) -> dict:
 # =========================
 # UI
 # =========================
-st.title("📄 Lector de Facturas Mejorado - OCR + OpenAI")
-st.markdown("**Versión mejorada** con mejor detección de números de factura y proveedores")
-
-# Test de conexión OpenAI
-if st.sidebar.button("🧪 Test OpenAI"):
-    try:
-        _ = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": "Responde solo: OK"}],
-            max_tokens=10
-        )
-        st.sidebar.success("✅ Conexión OpenAI funcionando")
-    except Exception as e:
-        st.sidebar.error(f"❌ Error OpenAI: {e}")
-
-with st.expander("ℹ️ Información"):
-    st.markdown("""
-**Mejoras implementadas:**
-- ✅ Patrones más específicos para números de factura
-- ✅ Mejor preprocesamiento de imágenes para OCR
-- ✅ Validación mejorada de números de factura
-- ✅ Detección más robusta de proveedores
-- ✅ Combinación inteligente de resultados AI + Regex
-- ✅ Mejor manejo de errores y debugging
-""")
-
+st.title("📄 Lector de Facturas - OCR + OpenAI")
 uploaded_files = st.file_uploader(
     "Selecciona archivos de facturas",
     type=['pdf', 'png', 'jpg', 'jpeg'],
@@ -544,7 +450,6 @@ uploaded_files = st.file_uploader(
 )
 
 if uploaded_files:
-    st.info(f"📁 {len(uploaded_files)} archivo(s) cargado(s)")
     if st.button("🚀 Procesar Facturas", type="primary"):
         progress_bar = st.progress(0)
         status_text = st.empty()
@@ -555,32 +460,16 @@ if uploaded_files:
             progress_bar.progress((i + 1) / len(uploaded_files))
         status_text.text("✅ ¡Procesamiento completado!")
 
-        st.subheader("📊 Resultados")
-        df = pd.DataFrame(results)
+        # DataFrame SOLO con columnas requeridas
+        df = pd.DataFrame(results)[['nro_factura', 'proveedor']]
 
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            facturas_ok = sum(1 for r in results if r["nro_factura"] not in ["No encontrado", "Error: No se pudo extraer texto"] and not str(r["nro_factura"]).startswith("Error:"))
-            st.metric("✅ Facturas detectadas", facturas_ok)
-        with col2:
-            proveedores_ok = sum(1 for r in results if r["proveedor"] not in ["No encontrado", "Error: No se pudo extraer texto"] and not str(r["proveedor"]).startswith("Error:"))
-            st.metric("✅ Proveedores detectados", proveedores_ok)
-        with col3:
-            st.metric("📄 Total archivos", len(results))
+        st.subheader("📊 Datos extraídos")
+        # Tabla limpia sin estilos que cambien color del texto
+        st.dataframe(df, use_container_width=True)
 
-        def highlight_status(val):
-            if "Error:" in str(val):
-                return 'background-color: #ffebee'
-            elif str(val) == "No encontrado":
-                return 'background-color: #fff3e0'
-            else:
-                return 'background-color: #e8f5e8'
-
-        styled_df = df.style.applymap(highlight_status, subset=['nro_factura', 'proveedor'])
-        st.dataframe(styled_df, use_container_width=True)
-
+        # Descargas (solo Excel y PDF)
         st.subheader("📥 Descargas")
-        c1, c2, c3 = st.columns(3)
+        c1, c2 = st.columns(2)
         with c1:
             excel_buffer = io.BytesIO()
             df.to_excel(excel_buffer, index=False, engine='openpyxl')
@@ -592,28 +481,18 @@ if uploaded_files:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
         with c2:
-            csv = df.to_csv(index=False)
-            st.download_button(
-                "📄 Descargar CSV",
-                data=csv,
-                file_name="facturas_procesadas.csv",
-                mime="text/csv"
-            )
-        with c3:
-            pdf_buffer = create_pdf_report(results)
+            pdf_bytes = create_pdf_report(df)
             st.download_button(
                 "📑 Descargar PDF",
-                data=pdf_buffer,
+                data=pdf_bytes,
                 file_name="reporte_facturas.pdf",
                 mime="application/pdf"
             )
 
-# Limpiar sesión
+# Limpiar sesión (opcional)
 if st.sidebar.button("🗑️ Limpiar datos"):
     st.session_state.clear()
     st.rerun()
-
-
 
 
 
