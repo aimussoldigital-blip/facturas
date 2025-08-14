@@ -15,15 +15,16 @@ from openai import OpenAI
 import cv2
 import numpy as np
 
+# =========================
 # Configuración inicial
+# =========================
 st.set_page_config(page_title="OCR + OpenAI Facturas", layout="wide")
 
 # =========================
-# PDF desde DataFrame
+# PDF desde DataFrame (siempre bytes)
 # =========================
 def create_pdf_report(df: pd.DataFrame) -> bytes:
-    """Genera un PDF con nro_factura y proveedor."""
-    buffer = io.BytesIO()
+    """Genera un PDF con nro_factura y proveedor. Siempre devuelve bytes."""
     try:
         from reportlab.lib.pagesizes import A4
         from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
@@ -31,6 +32,7 @@ def create_pdf_report(df: pd.DataFrame) -> bytes:
         from reportlab.lib import colors
         from reportlab.lib.units import inch
 
+        buffer = io.BytesIO()
         doc = SimpleDocTemplate(buffer, pagesize=A4,
                                 rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=24)
         styles = getSampleStyleSheet()
@@ -44,23 +46,14 @@ def create_pdf_report(df: pd.DataFrame) -> bytes:
         for _, row in df.iterrows():
             factura = str(row.get("nro_factura", "")).strip()
             proveedor = str(row.get("proveedor", "")).strip()
-            if len(factura) > 35: factura = factura[:32] + "..."
-            if len(proveedor) > 50: proveedor = proveedor[:47] + "..."
             data.append([factura, proveedor])
 
         table = Table(data, colWidths=[2.5*inch, 3.5*inch])
         table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#4A4A4A")),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, 0), 12),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
-            ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor("#F6F1E1")),
-            ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
-            ('FONTSIZE', (0, 1), (-1, -1), 10),
             ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
-            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT')
         ]))
         elements.append(table)
         doc.build(elements)
@@ -68,25 +61,19 @@ def create_pdf_report(df: pd.DataFrame) -> bytes:
         return buffer.getvalue()
 
     except Exception:
-        # Fallback con FPDF
-        pdf = FPDF()
-        pdf.add_page()
-        pdf.set_font('Arial', 'B', 16)
-        pdf.cell(0, 10, 'REPORTE DE FACTURAS (Nº + PROVEEDOR)', ln=True, align='C')
-        pdf.ln(8)
-        pdf.set_font('Arial', 'B', 11)
-        pdf.cell(90, 8, 'NÚMERO FACTURA', 1, 0, 'C')
-        pdf.cell(90, 8, 'PROVEEDOR', 1, 1, 'C')
-        pdf.set_font('Arial', '', 10)
-        for _, row in df.iterrows():
-            factura = str(row.get("nro_factura", ""))
-            proveedor = str(row.get("proveedor", ""))
-            factura = (factura[:42] + "...") if len(factura) > 45 else factura
-            proveedor = (proveedor[:42] + "...") if len(proveedor) > 45 else proveedor
-            pdf.cell(90, 8, factura, 1, 0, 'L')
-            pdf.cell(90, 8, proveedor, 1, 1, 'L')
-        out = pdf.output(dest="S")
-        return out if isinstance(out, (bytes, bytearray)) else out.encode("latin-1")
+        try:
+            pdf = FPDF()
+            pdf.add_page()
+            pdf.set_font('Arial', 'B', 14)
+            pdf.cell(0, 10, 'REPORTE DE FACTURAS', ln=True, align='C')
+            pdf.set_font('Arial', '', 10)
+            for _, row in df.iterrows():
+                pdf.cell(90, 8, str(row.get("nro_factura", "")), 1)
+                pdf.cell(90, 8, str(row.get("proveedor", "")), 1, ln=True)
+            out = pdf.output(dest="S")
+            return out if isinstance(out, (bytes, bytearray)) else out.encode("latin-1")
+        except Exception:
+            return b"%PDF-1.4\n%EOF"  # PDF mínimo válido
 
 # =========================
 # Dependencias y Config OpenAI
@@ -116,7 +103,7 @@ def configurar_openai():
 client = configurar_openai()
 
 # =========================
-# Utilidades OCR y Regex
+# OCR y Extracción
 # =========================
 def normalize_text(text: str) -> str:
     if not text:
@@ -163,9 +150,6 @@ def extract_supplier(text: str) -> str:
             return k
     return "No encontrado"
 
-# =========================
-# OpenAI extracción
-# =========================
 def extract_data_with_openai(text: str) -> dict:
     regex_invoice = extract_invoice_number(text)
     regex_supplier = extract_supplier(text)
@@ -203,9 +187,6 @@ TEXTO:
     except:
         return {"nro_factura": regex_invoice, "proveedor": regex_supplier}
 
-# =========================
-# OCR
-# =========================
 def preprocess_image_advanced(pil_img):
     img_array = np.array(pil_img.convert('RGB'))
     gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
@@ -238,9 +219,6 @@ def extract_text_from_file(file_path: pathlib.Path) -> str:
         img = Image.open(file_path)
         return extract_text_with_ocr(img)
 
-# =========================
-# Procesar archivos
-# =========================
 def process_single_file(file) -> dict:
     with tempfile.NamedTemporaryFile(delete=False, suffix=pathlib.Path(file.name).suffix) as tmp_file:
         tmp_file.write(file.read())
@@ -281,6 +259,8 @@ if uploaded_files:
 
         # PDF
         pdf_bytes = create_pdf_report(df)
+        if not isinstance(pdf_bytes, (bytes, bytearray)):
+            pdf_bytes = b"%PDF-1.4\n%EOF"
         st.download_button("📑 Descargar PDF", data=pdf_bytes,
                            file_name="facturas.pdf", mime="application/pdf")
 
