@@ -1,1 +1,7 @@
-render.yaml
+services:
+  - type: web
+    name: facturas-openai
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run facturas_openai.py --server.port $PORT --server.address 0.0.0.0
+    autoDeploy: true
